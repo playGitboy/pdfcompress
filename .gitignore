@@ -1,0 +1,37 @@
+# 编译产物 / build artifacts
+/pdfcompress
+/pdfcompress.exe
+/pdfcompress_*
+*.exe
+*.tmp
+
+# 内置运行时（体积大，随 Release 离线包分发，不进仓库）
+# bundled Ghostscript runtime — shipped inside Release archives, not in the repo
+/gs/
+/ghostscript/
+
+# 测试语料：严禁上传 / test corpus: never upload
+*.pdf
+/test_samples/
+/testdata/
+/test/
+
+# 备份与临时目录 / backups & temp
+/backup_before_upx/
+/bak/
+*.bak
+*.orig
+
+# 编辑器 / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# 操作系统 / OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地笔记 / local notes
+.workbuddy-ai/
