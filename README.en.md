@@ -50,9 +50,34 @@ works well on both **image-heavy (scanned)** and **text-heavy (electronic docume
 **Linux (Kylin / UOS, ARM64 & x86_64)**
 
 1. Extract `PDFCompress-linux-<arch>.tar.gz` (**always use `tar`, never a GUI copy**, or the
-   executable bits will be lost).
-2. In a file manager, drag PDFs onto the `pdfcompress` icon; or run
-   `./pdfcompress file1.pdf file2.pdf`.
+   executable bits will be lost):
+   ```bash
+   tar -xzf PDFCompress-linux-arm64.tar.gz
+   cd PDFCompress-linux-arm64
+   ```
+2. **Enable drag-and-drop** (recommended, run once):
+   ```bash
+   sh 安装拖放.sh
+   ```
+   The script fixes permissions, creates a "PDF压缩" icon on the desktop, and registers the
+   app in the application menu. Afterwards select PDF files (or a folder) and **drop them onto
+   that icon** — a terminal window opens showing progress. If the icon shows "untrusted",
+   right-click it and choose "Allow launching".
+
+3. Or use the command line directly:
+   ```bash
+   ./pdfcompress file1.pdf file2.pdf    # shorthand equivalent to drag-and-drop
+   ./pdfcompress -dir ./inbox -r        # recursive batch
+   ```
+
+> **Why `安装拖放.sh` is needed**: Linux desktops (GNOME/KDE/UKUI/DDE) implement
+> "drop a file onto an app icon" as a call of the form `program file1 file2 ...`, which
+> requires a `.desktop` launcher to declare that entry point. The program already treats
+> positional arguments as files/directories to process when launched with no flags, so the
+> script only needs to generate a `.desktop` file plus a terminal wrapper — **no program
+> logic changes**. It auto-detects 10 common terminal emulators (ukui-terminal,
+> deepin-terminal, gnome-terminal, konsole, xterm, …) and waits for Enter when done, so the
+> window never flashes by.
 
 > Drag-and-drop is a "no arguments" launch, equivalent to batch mode below, producing
 > `originalname_<level>.pdf`.
