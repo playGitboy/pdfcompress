@@ -565,13 +565,13 @@ func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quie
 
 	compSize := fileSize(writePath)
 	kept := false
-	if overwrite {
-		if compSize <= 0 || compSize >= origSize {
-			// 压缩后没有变小，保留原文件更划算
-			os.Remove(writePath)
-			compSize = origSize
-			kept = true
-		} else if err := replaceOriginal(writePath, input); err != nil {
+	if compSize <= 0 || compSize >= origSize {
+		// 压缩后没有变小，保留原文件更划算
+		os.Remove(writePath)
+		compSize = origSize
+		kept = true
+	} else if overwrite {
+		if err := replaceOriginal(writePath, input); err != nil {
 			os.Remove(writePath)
 			fmt.Fprintf(os.Stderr, "压缩失败: 替换原文件失败（文件可能被占用）: %v\n", err)
 			return false
@@ -590,12 +590,12 @@ func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quie
 		fmt.Printf("压缩后:   %s\n", formatSize(compSize))
 		fmt.Printf("压缩率:   %.1f%%\n", ratio)
 		fmt.Printf("耗时:     %s\n", time.Since(start).Round(time.Millisecond))
-		if overwrite {
-			if kept {
-				fmt.Println("输出:     已保留原文件（压缩后未变小）")
-			} else {
-				fmt.Println("输出:     已覆盖原文件")
-			}
+		if kept {
+			fmt.Println("输出:     已保留原文件（压缩后未变小）")
+		} else if overwrite {
+			fmt.Println("输出:     已覆盖原文件")
+		} else {
+			fmt.Printf("输出:     %s\n", output)
 		}
 	} else {
 		tag := "OK"
@@ -871,11 +871,11 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 			// 后处理：覆盖模式下用临时文件替换原文件；未变小时保留原文件
 			finalize := func(t *fileTask) fileResult {
 				compSize := fileSize(t.writePath)
+				if compSize <= 0 || compSize >= t.orig {
+					os.Remove(t.writePath)
+					return fileResult{task: t, compSize: t.orig, kept: true}
+				}
 				if t.overwrite {
-					if compSize <= 0 || compSize >= t.orig {
-						os.Remove(t.writePath)
-						return fileResult{task: t, compSize: t.orig, kept: true}
-					}
 					if err := replaceOriginal(t.writePath, t.finalPath); err != nil {
 						os.Remove(t.writePath)
 						return fileResult{task: t, err: fmt.Errorf("替换原文件失败（可能被占用）: %v", err)}
