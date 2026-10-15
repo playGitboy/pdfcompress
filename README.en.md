@@ -254,6 +254,30 @@ Only then do `screen`=72 / `ebook`=150 / `printer`=300 DPI actually mean what th
 
 ---
 
+## Safety guard for abnormal files (encrypted / structurally damaged)
+
+For **encrypted PDFs** and **structurally damaged PDFs**, Ghostscript exits with **code 0**
+while writing a tiny PDF containing only blank pages (~2–3 KB). Judging success by size alone
+would report it as `OK 100%` — and in `--overwrite` mode it would replace the original with a
+blank file, causing **irreversible data loss**.
+
+The tool therefore detects Ghostscript's fatal signatures, marks the file as failed, and
+**keeps the original**:
+
+| Input | Result |
+| --- | --- |
+| Encrypted PDF (password required) | `FAIL` — file is encrypted, a password is required (original kept) |
+| Damaged / unparseable structure | `FAIL` — cannot parse the source file (original kept) |
+| Non-PDF (renamed impostor) | `FAIL` (Ghostscript error) |
+| Empty file (0 bytes) | `KEEP` (left untouched) |
+
+No partial or blank artifacts are left behind in the output directory for failed files.
+
+> Note: a PDF that is only mildly non-conformant but that Ghostscript can read in full
+> (all pages parsed) is still compressed normally; only files that cannot be read at all fail.
+
+---
+
 ## Supported systems (all fully offline)
 
 | Platform | Architecture | Offline package | Requirements |

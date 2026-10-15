@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "2.1.0"
+	version = "2.2.0"
 	author  = "https://github.com/playgitboy"
 )
 
@@ -354,6 +354,29 @@ func gsErr(err error, out string) error {
 	return fmt.Errorf("%v: %s", err, msg)
 }
 
+// gsFatalReadProblem 识别「源文件根本没能被 gs 读入」的致命情形。
+//
+// 背景（2026-10-15 实测）：对加密 PDF、结构损坏的 PDF，gs 依然会以**退出码 0**
+// 结束，并把问题只写在 stderr 里；同时它仍会写出一个仅含空白页的极小 PDF
+// （约 2-3 KB）。由于体积远小于原文件，仅凭体积的安全网会把这种退化输出
+// 误判为「压缩成功」，甚至在 --overwrite 模式下用空白文件替换掉原文件。
+// 因此必须显式识别这些签名，直接判为失败并保留原文件。
+//
+// 返回面向用户的错误说明；未命中任何致命签名时返回 nil。
+func gsFatalReadProblem(out string) error {
+	switch {
+	case strings.Contains(out, "requires a password for access"):
+		return fmt.Errorf("源文件已加密，需要密码才能压缩（已保留原文件）")
+	case strings.Contains(out, "Couldn't initialise file"):
+		return fmt.Errorf("无法解析源文件（可能已加密或结构损坏，已保留原文件）")
+	case strings.Contains(out, "No pages will be processed"):
+		return fmt.Errorf("源文件未解析出任何页面（已保留原文件）")
+	case strings.Contains(out, "Unrecoverable error"):
+		return fmt.Errorf("源文件无法解析（已保留原文件）")
+	}
+	return nil
+}
+
 // withSep 保证目录路径以分隔符结尾（gs 的 --permit-file-* 用目录时要求如此）
 func withSep(dir string) string {
 	dir = strings.ReplaceAll(dir, `\`, "/")
@@ -471,6 +494,12 @@ func compressFile(gsExe, input, output string, level CompressLevel, gsThreads in
 	if err != nil {
 		return gsErr(err, string(outputBytes))
 	}
+	// 源文件没能被读入时 gs 仍返回 0，却写出一个空白迷你 PDF；
+	// 这里必须显式判失败，否则会把它当成「压缩成功」。
+	if msg := gsFatalReadProblem(string(outputBytes)); msg != nil {
+		os.Remove(output)
+		return msg
+	}
 	if !validOutput(output) {
 		return fmt.Errorf("压缩失败，未生成输出文件")
 	}
@@ -531,6 +560,12 @@ func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
 	outBytes, err := cmd.CombinedOutput()
 	if err != nil {
 		return gsErr(err, string(outBytes))
+	}
+	// 块内只要有任何文件是「加密/无法解析」，就在共享的 stderr 里留下致命签名。
+	// 此时整块结果不可信：返回错误让上层降级为逐文件处理，由 compressFile
+	// 逐个精确定位并为坏文件保留原文。正常文件不会命中这些签名。
+	if msg := gsFatalReadProblem(string(outBytes)); msg != nil {
+		return msg
 	}
 	return nil
 }
@@ -608,9 +643,9 @@ func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quie
 	}
 
 	if err := compressFile(gsExe, input, writePath, level, gsThreads); err != nil {
-		if overwrite {
-			os.Remove(writePath)
-		}
+		// 失败时清掉本次可能写出的半成品（含 gs 产出的空白迷你 PDF），
+		// 避免在输出目录留下误导性的文件。
+		os.Remove(writePath)
 		fmt.Fprintf(os.Stderr, "压缩失败: %v\n", err)
 		return false
 	}
