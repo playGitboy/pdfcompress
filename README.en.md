@@ -125,6 +125,7 @@ pdfcompress -dir ./inbox -gs "C:\gs\bin\gswin32c.exe"
 | `-chunk` | Files processed per Ghostscript process | `0` (auto) |
 | `-overwrite` | Replace originals (kept if the result is not smaller) | `false` |
 | `-gs` | Path to Ghostscript | auto-detected |
+| `-timeout` | Stall guard: skip a file after this many seconds with no progress output (`0` = disabled) | `180` |
 | `-q` | Quiet mode | `false` |
 | `-version` | Print version information | — |
 
@@ -184,6 +185,31 @@ Ghostscript can compute the true DPI and downsample normally. The target size **
 original aspect ratio** (long edge maps to paper long edge, short edge is scaled proportionally),
 preventing ~6% stretch distortion that would happen if a 4:3 photo were forced into A4.
 
+### Grouping and reproducibility (fixed in v2.3.0)
+
+Geometry-fix arguments are **process-wide** in Ghostscript: every file handled by one process
+shares a single page size. Files must therefore be sorted into "geometry groups" first, and only
+members of the same group may share a process. Two things must hold:
+
+1. **The probe result must be deterministic.** The main page size used to be picked by ranging
+   over a map for the "most frequent" size — but Go randomises map iteration order, so when
+   several sizes **tie** (very common in mixed-layout documents, e.g. 2 pages with 2 distinct
+   sizes) the winner was random, and the *same file* could be classified differently on different
+   runs. It is now selected from an **explicitly sorted list** (most pages first; on a tie, the
+   larger long edge wins), so results are fully reproducible.
+2. **The group key must include the target page size**, not just the paper name. Since the target
+   size is derived from the **original aspect ratio**, two A4-classified scans with different
+   source proportions (a 4:3 phone photo vs a √2 scanner) get different targets; keying on the
+   paper name alone forced them to share `chunk[0]`'s page size — adding spurious white margins to
+   one and making the compression ratio depend on "who the neighbour is".
+
+Measured before the fix: running the same 89-file corpus twice produced **4 files with different
+sizes** (`test (64)` differed by 771 KB, ~2.2×), and batch mode disagreed with single-file mode
+(`test (1)` by 115 KB). After the fix: two consecutive runs are **byte-for-byte the same size for
+87/88 files** (one file shows an 8-byte document-ID jitter, which is Ghostscript's own behaviour),
+and **batch mode matches single-file mode exactly** (differing only by the output path length
+embedded in the metadata).
+
 ### Measured results
 
 - 89 files / 948 MB real corpus: **83 standard (unchanged) / 4 pixel-as-point (fixed) / 2
@@ -197,6 +223,9 @@ preventing ~6% stretch distortion that would happen if a 4:3 photo were forced i
   | test (64) | 23.33 MB | 108 KB | **337 KB** | 1091 KB |
   | test (104) | 4.75 MB | 31 KB | **113 KB** | 290 KB |
 
+- **Page aspect matches the source**: `test (1)` is 4:3 and now produces a 4:3 page (previously it
+  inherited its neighbour's √2 page size and gained letterbox margins). Batch mode and single-file
+  mode now agree.
 - **Zero impact on standard A4**: the same official document produces 271,669 bytes before and
   after; the only byte differences are timestamps and document IDs, and the xref offset table is
   byte-identical.
@@ -275,6 +304,80 @@ No partial or blank artifacts are left behind in the output directory for failed
 
 > Note: a PDF that is only mildly non-conformant but that Ghostscript can read in full
 > (all pages parsed) is still compressed normally; only files that cannot be read at all fail.
+
+---
+
+## Stall guard (no-progress timeout)
+
+Some heavily damaged PDFs send Ghostscript into a long recovery scan, showing up as the
+program producing **no output for a long time** — users reasonably assume the whole run has hung.
+
+### Why a total-runtime timeout does not work
+
+Large files are simply slow: a 1 GB scanned document legitimately takes several minutes.
+A fixed total-time limit (say 3 minutes) would **kill such files by mistake**.
+
+### The criterion is "is it making progress", not "how long has it run"
+
+Ghostscript prints a page-progress line (`Page N`) as it finishes each page. So the tool
+watches the **interval between outputs**:
+
+- As long as output keeps flowing, the file is progressing and is **never interrupted**,
+  no matter how long it takes;
+- Once there is **no output at all** for `-timeout` seconds (default 180 s), the file is
+  treated as stalled and its process is terminated.
+
+A 1 GB file is therefore never mis-killed, while a genuinely stuck file is caught within
+about three minutes.
+
+### What happens on timeout
+
+A stall verdict **never destroys data**:
+
+1. Terminate the Ghostscript process for that file;
+2. Remove any partial output;
+3. **Keep the original file** (never replaced, even in `--overwrite` mode);
+4. Report `FAIL` and move on — **other files keep processing**.
+
+So even in the unlikely event of a misjudgement, the worst case is "this file was not
+compressed". **Data loss is not possible.** An unusually slow file can be re-run on its own,
+or the guard can be relaxed or disabled:
+
+```bash
+pdfcompress -dir <dir> -timeout 0     # disable the stall guard
+pdfcompress -dir <dir> -timeout 600   # relax it to 10 minutes
+```
+
+> Note: to obtain the page-progress signal, `-dQUIET` is no longer passed to Ghostscript.
+> That flag only suppresses progress and the startup banner; it **does not affect the
+> compression result** (measured: old and new builds render page-for-page identically —
+> only the PDF metadata records one fewer command-line argument) and does not change how
+> abnormal files are judged.
+
+---
+
+## Why `-dPDFSTOPONERROR` is not enabled
+
+`-dPDFSTOPONERROR=true` was considered as a "fail fast on broken files" option and was
+**rejected after measurement**:
+
+| File type | Off (current) | With `-dPDFSTOPONERROR` |
+| --- | --- | --- |
+| Fully valid PDF | Compressed normally | Byte-for-byte identical (nothing to trigger) |
+| PDF with recoverable page errors | Ghostscript repairs and **carries on**; output essentially complete | Aborts **remaining rendering** on first error → bad page and everything after turn blank; **exit code is still 0**, so the guard misjudges it as success |
+| Encrypted / badly damaged | Already caught by the safety guard; kept as original | Also caught by the guard — **no extra benefit** |
+
+The verdict is **~zero benefit, non-zero risk**: fatal errors are already caught precisely by
+the text-signature guard, which does not depend on this flag — but the flag silently
+upgrades "recoverable bad page" into "silently dropped content", which you cannot even
+detect (exit code 0, non-empty output, smaller file — it looks like success). Its behaviour
+also differs across Ghostscript versions (some discard only the current page, others
+terminate the process), which conflicts with a predictable, identical behaviour on all
+three platforms.
+
+The real problem to solve is a **hung process**, and that is handled by the stall guard
+above: it judges from outside the process, does not depend on Ghostscript version
+behaviour, and its failure mode is observable and reversible.
 
 ---
 

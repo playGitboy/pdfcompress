@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,9 +19,41 @@ import (
 )
 
 var (
-	version = "2.2.0"
+	version = "2.3.0"
 	author  = "https://github.com/playgitboy"
 )
+
+// ---- 卡死保护（停滞超时）----
+//
+// 判据不是「总耗时」，而是「两次输出之间的间隔」。
+//
+// 正常的大文件（例如 1GB 扫描件）跑几分钟完全正常，用固定总时长做超时必然
+// 误杀它；而真正卡死的特征是「进程活着但长时间一声不吭」。Ghostscript 每处理
+// 完一页就会往 stdout 打印一行 "Page N"，这行进度就是「还在推进」的证据。
+//
+// 因此这里只在「连续 stallTimeout 时长内没有任何输出」时才判定卡死并终止进程，
+// 只要还在持续输出，跑多久都不会被打断。
+var (
+	// stallTimeout 停滞阈值：连续这么久没有任何输出即判定卡死。0 = 关闭该保护。
+	stallTimeout = 180 * time.Second
+
+	// firstOutputTimeout 首次输出阈值：进程启动后这么久仍无任何输出即判定卡死。
+	// 用于覆盖「gs 根本起不来」的情形（正常情况下约 300ms 就会打印第一行）。
+	firstOutputTimeout = 60 * time.Second
+)
+
+const (
+	// watchdogInterval 看门狗检查间隔
+	watchdogInterval = time.Second
+
+	// maxGSOutputBytes 采集 gs 输出的上限。
+	// 正常失败场景输出只有几 KB；进度输出每页约 8 字节，4MB 足够容纳约 50 万页，
+	// 因此该上限实际不会被触发，仅作为内存兜底。
+	maxGSOutputBytes = 4 << 20
+)
+
+// errGSStalled 表示 gs 因长时间无输出被判为卡死（区别于普通的 gs 报错）。
+var errGSStalled = errors.New("处理停滞")
 
 // tableSepWidth 结果表格分隔线的宽度。
 //
@@ -175,7 +210,15 @@ func baseGSArgs() []string {
 		"-sDEVICE=pdfwrite",
 		"-dCompatibilityLevel=1.4",
 		"-dNOPAUSE",
-		"-dQUIET",
+		// ⚠ 刻意不使用 -dQUIET。
+		//
+		// -dQUIET 会把 gs 的进度输出（"Processing pages N through M."、"Page N"）
+		// 一并抑制（实测该参数下 stdout/stderr 全程为 0 字节），而「卡死保护」
+		// 正是靠这些进度行判断进程是否还在推进 —— 静默之后就没有任何信号可用了。
+		//
+		// 保持非静默的代价只是输出缓冲里多出若干行进度文本（每页约 8 字节，
+		// 且已在 runGS 中做了 4MB 上限兜底），对速度与压缩结果均无影响。
+		// 错误与警告本就不受 -dQUIET 抑制，因此去掉它不会改变异常文件的处理结果。
 		"-dBATCH",
 		"-dAutoRotatePages=/None",
 		// ⚠ 关闭 JPEG 透传是「压缩率≈0」的关键修复之一。
@@ -216,16 +259,26 @@ func baseGSArgs() []string {
 // 同一分组的文件可以放进同一个 gs 进程；不同分组必须分开，
 // 因为几何基准修正参数是进程级的（见 compressChunk 注释）。
 //
-//	"std"        —— 标准纸张或无法判定：沿用原有参数，"行为与旧版完全一致"
-//	"fix:A4" 等  —— 像素当 pt 扫描件：启用 FIXEDMEDIA/FitPage/-r 修正
+//	"std"                   —— 标准纸张或无法判定：沿用原有参数，"行为与旧版完全一致"
+//	"fix:A4:631.5x842.0" 等 —— 像素当 pt 扫描件：启用 FIXEDMEDIA/FitPage/-r 修正
+//
+// ⚠ 键里必须带上「目标页面尺寸」，不能只带纸张名。
+// 原因：目标尺寸由 targetPageSize 按**原始长宽比**反算（见该函数注释），
+// 所以同为 A4 的两份扫描件，若原稿比例不同（如 4:3 手机拍摄 vs √2 扫描仪），
+// 目标尺寸并不相同。若只按纸张名分组，它们会被塞进同一进程、被迫共用
+// chunk[0] 的页面尺寸 —— 其中一份会被加上多余白边，且压缩率随「邻居是谁」漂移。
+// 带上尺寸后，任一文件的处理参数只由自身决定，与批次组成无关，
+// 也与「单文件模式」的结果完全一致。
 func geomGroupKey(g pdfGeom) string {
 	if !g.shouldFixGeometry() {
 		return "std"
 	}
-	if g.paper.name == "" {
-		return "fix:A4"
+	name := g.paper.name
+	if name == "" {
+		name = "A4"
 	}
-	return "fix:" + g.paper.name
+	pw, ph := targetPageSize(g)
+	return fmt.Sprintf("fix:%s:%.1fx%.1f", name, pw, ph)
 }
 
 // 用于「几何基准修正」时通过 -r 重设 gs 的 DPI 基准。
@@ -341,17 +394,168 @@ func truncName(s string, max int) string {
 
 // gsErr 把 Ghostscript 的冗长报错压缩成一行，便于阅读
 func gsErr(err error, out string) error {
-	msg := strings.TrimSpace(out)
-	if i := strings.IndexAny(msg, "\r\n"); i >= 0 {
-		msg = msg[:i]
-	}
-	if len(msg) > 200 {
-		msg = msg[:200] + "..."
-	}
+	msg := gsErrorLine(out)
 	if msg == "" {
 		return err
 	}
 	return fmt.Errorf("%v: %s", err, msg)
+}
+
+// gsErrorLine 从 gs 的输出里挑出最有信息量的一行作为错误说明。
+//
+// 去掉 -dQUIET 之后，gs 会先打印版本横幅（"GPL Ghostscript 9.56.1 ..."），
+// 若沿用原来的「取第一行」策略，错误说明就会变成版权信息。
+// 因此这里优先查找形如 "**** Error: ..." 的硬错误行，找不到才退回第一行。
+func gsErrorLine(out string) string {
+	first := ""
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if first == "" {
+			first = ln
+		}
+		if isGSFaultLine(ln) {
+			return clipMsg(ln)
+		}
+	}
+	return clipMsg(first)
+}
+
+// isGSFaultLine 判断某行是否为 Ghostscript 的硬错误行（而非进度、横幅或警告汇总）
+func isGSFaultLine(ln string) bool {
+	return strings.Contains(ln, "Error:") ||
+		strings.Contains(ln, "Unrecoverable error") ||
+		strings.Contains(ln, "Couldn't") ||
+		strings.Contains(ln, "No pages will be processed") ||
+		strings.Contains(ln, "requires a password")
+}
+
+// clipMsg 把单行消息按字节截断到 200 字符
+func clipMsg(msg string) string {
+	if len(msg) > 200 {
+		return msg[:200] + "..."
+	}
+	return msg
+}
+
+// runGS 运行 Ghostscript，并在「长时间没有任何输出」时判定卡死、终止进程。
+//
+// 判据不是「总耗时」而是「两次输出之间的间隔」：正常大文件跑几分钟很常见，
+// 但只要它还在持续打印页进度（"Page N"），就说明在处理，绝不能打断；
+// 真正卡死的特征是「进程活着却长时间一声不吭」。因此只有连续 stallTimeout
+// 内毫无输出时才终止，这样 1GB 级别的大文件永远不会被误杀。
+//
+// 返回 gs 合并后的输出（stdout + stderr）与错误。
+// 因停滞被终止时，返回的错误包装了 errGSStalled，调用方可用 errors.Is 识别。
+func runGS(gsExe string, args []string) (string, error) {
+	cmd := exec.Command(gsExe, args...)
+	cmd.Stdin = nil
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var mu sync.Mutex
+	var buf strings.Builder
+	var lastNano int64 // 0 表示「尚未收到任何输出」
+
+	// 并发读取两路管道：只要读到任意字节就刷新时间戳，作为「仍在推进」的证据。
+	// 不按行读取 —— 这样即使 gs 用 \r 刷新进度也能被及时感知。
+	var rwg sync.WaitGroup
+	consume := func(r io.Reader) {
+		defer rwg.Done()
+		b := make([]byte, 32*1024)
+		for {
+			n, rerr := r.Read(b)
+			if n > 0 {
+				atomic.StoreInt64(&lastNano, time.Now().UnixNano())
+				mu.Lock()
+				if buf.Len() < maxGSOutputBytes {
+					buf.Write(b[:n])
+				}
+				mu.Unlock()
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}
+	rwg.Add(2)
+	go consume(stdout)
+	go consume(stderr)
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	var runErr error
+	stalled := false
+	var stalledLimit time.Duration
+
+	if stallTimeout > 0 {
+		ticker := time.NewTicker(watchdogInterval)
+	watchdog:
+		for {
+			select {
+			case runErr = <-waitErr:
+				break watchdog
+			case <-ticker.C:
+				n := atomic.LoadInt64(&lastNano)
+				limit := stallTimeout
+				var idle time.Duration
+				if n == 0 {
+					// 还没有任何输出：用更短的「首次输出」阈值兜底
+					limit = firstOutputTimeout
+					idle = time.Since(start)
+				} else {
+					idle = time.Since(time.Unix(0, n))
+				}
+				if idle > limit {
+					stalled = true
+					stalledLimit = limit
+					_ = cmd.Process.Kill()
+					// 等待回收；极端情况下 Wait 可能迟迟不返回，加超时兜底避免主流程挂死
+					select {
+					case runErr = <-waitErr:
+					case <-time.After(10 * time.Second):
+					}
+					break watchdog
+				}
+			}
+		}
+		ticker.Stop()
+	} else {
+		runErr = <-waitErr
+	}
+
+	// 等读取协程收尾（进程退出后管道关闭会自然返回）；同样加超时兜底
+	rwgDone := make(chan struct{})
+	go func() { rwg.Wait(); close(rwgDone) }()
+	select {
+	case <-rwgDone:
+	case <-time.After(5 * time.Second):
+	}
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+
+	if stalled {
+		return out, fmt.Errorf("%w：连续 %s 没有任何进度输出，已终止（已保留原文件）",
+			errGSStalled, stalledLimit.Round(time.Second))
+	}
+	return out, runErr
 }
 
 // gsFatalReadProblem 识别「源文件根本没能被 gs 读入」的致命情形。
@@ -453,8 +657,14 @@ func findGhostscript() (string, error) {
 
 // detectGSVersion 读取 Ghostscript 主/次版本号
 // 用途：--permit-file-read/write 需要 gs >= 9.50（该版本起 SAFER 默认开启）
+//
+// 带超时：版本探测是启动路径上的第一件事，万一 gs 无法正常响应 --version，
+// 不能让整个流程无限期挂住。10 秒足够任何正常的 gs 返回。
 func detectGSVersion(gsExe string) (major, minor int, ok bool) {
-	out, err := exec.Command(gsExe, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, gsExe, "--version").Output()
 	if err != nil {
 		return 0, 0, false
 	}
@@ -488,15 +698,19 @@ func compressFile(gsExe, input, output string, level CompressLevel, gsThreads in
 	args = append(args, gsSettings(level)...)
 	args = append(args, fmt.Sprintf("-sOutputFile=%s", sOutputFileValue(output)), input)
 
-	cmd := exec.Command(gsExe, args...)
-	cmd.Stdin = nil
-	outputBytes, err := cmd.CombinedOutput()
-	if err != nil {
-		return gsErr(err, string(outputBytes))
+	out, runErr := runGS(gsExe, args)
+	// 停滞超时：进程是被我们主动终止的，产物必然残缺，
+	// 直接判失败并清掉半成品（覆盖模式下原文件不会被动到）。
+	if errors.Is(runErr, errGSStalled) {
+		os.Remove(output)
+		return runErr
+	}
+	if runErr != nil {
+		return gsErr(runErr, out)
 	}
 	// 源文件没能被读入时 gs 仍返回 0，却写出一个空白迷你 PDF；
 	// 这里必须显式判失败，否则会把它当成「压缩成功」。
-	if msg := gsFatalReadProblem(string(outputBytes)); msg != nil {
+	if msg := gsFatalReadProblem(out); msg != nil {
 		os.Remove(output)
 		return msg
 	}
@@ -555,16 +769,19 @@ func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
 				psQuote(outputs[i]), psQuote(inputs[i])))
 	}
 
-	cmd := exec.Command(gsExe, args...)
-	cmd.Stdin = nil
-	outBytes, err := cmd.CombinedOutput()
-	if err != nil {
-		return gsErr(err, string(outBytes))
+	out, runErr := runGS(gsExe, args)
+	// 停滞超时：整块进程被终止，返回错误让上层降级为逐文件处理，
+	// 由 compressFile 逐个定位并单独为卡死的那个文件计时。
+	if errors.Is(runErr, errGSStalled) {
+		return runErr
 	}
-	// 块内只要有任何文件是「加密/无法解析」，就在共享的 stderr 里留下致命签名。
+	if runErr != nil {
+		return gsErr(runErr, out)
+	}
+	// 块内只要有任何文件是「加密/无法解析」，就在共享输出里留下致命签名。
 	// 此时整块结果不可信：返回错误让上层降级为逐文件处理，由 compressFile
 	// 逐个精确定位并为坏文件保留原文。正常文件不会命中这些签名。
-	if msg := gsFatalReadProblem(string(outBytes)); msg != nil {
+	if msg := gsFatalReadProblem(out); msg != nil {
 		return msg
 	}
 	return nil
@@ -835,6 +1052,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 	// 构造任务并预建输出目录（原实现每个文件都 MkdirAll 一次）
 	tasks := make([]*fileTask, 0, len(pdfs))
 	dirCache := make(map[string]bool, 16)
+	var geomDegraded []string
 	for i, p := range pdfs {
 		rel, relErr := filepath.Rel(absDir, p)
 		if relErr != nil {
@@ -859,7 +1077,23 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		// 像素当 pt 扫描件    → "fix:<纸张>"（启用几何基准修正）
 		t.geom = probePDFGeom(p)
 		t.geomKey = geomGroupKey(t.geom)
+		if t.geom.readDegraded {
+			geomDegraded = append(geomDegraded, rel)
+		}
 		tasks = append(tasks, t)
+	}
+
+	// 探测降级提示：读取不完整的文件，其几何判定可能失真 ——
+	// 本该启用修正的扫描件会被按常规参数处理，压缩率低于预期且无其它迹象。
+	// 如实提示（走 stderr，不干扰 stdout 的结果行），而不是静默降质。
+	if len(geomDegraded) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[提示] %d 个文件读取不完整，几何判定可能失真（将按常规参数处理，压缩率或低于预期）：\n",
+			len(geomDegraded))
+		for _, n := range geomDegraded {
+			fmt.Fprintf(os.Stderr, "  - %s\n", truncName(n, 60))
+		}
+		fmt.Fprintln(os.Stderr)
 	}
 
 	// 规划分块：决定“单进程多文件”还是“一文件一进程”
@@ -1150,6 +1384,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 var valueFlags = map[string]bool{
 	"i": true, "o": true, "dir": true, "out": true,
 	"level": true, "j": true, "gs": true, "gsThreads": true, "chunk": true,
+	"timeout": true,
 }
 
 // reorderArgs 把以"-"开头的选项及其值移动到位置参数之前。
@@ -1216,6 +1451,8 @@ func main() {
 	showVersion := flag.Bool("version", false, "显示版本信息")
 	quiet := flag.Bool("q", false, "静默模式")
 	gsPath := flag.String("gs", "", "指定Ghostscript路径")
+	timeoutSec := flag.Int("timeout", 180,
+		"卡死保护：连续该秒数无任何进度输出即判定卡死并跳过该文件（0=关闭；大文件处理慢不受影响，只要仍在输出进度就不会触发）")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "PDFCompress v%s - PDF批量压缩工具\n", version)
@@ -1244,12 +1481,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "                        四个级别结果基本相同（常见 15MB 压到 200KB 上下）。\n")
 		fmt.Fprintf(os.Stderr, "  图片型（扫描件等）  ：体积主要来自扫描图像，级别越高保留分辨率越高，\n")
 		fmt.Fprintf(os.Stderr, "                        体积与清晰度差别明显，请按用途选择。\n")
+		fmt.Fprintf(os.Stderr, "\n关于大文件与卡死保护:\n")
+		fmt.Fprintf(os.Stderr, "  大文件处理慢是正常的（1GB 扫描件处理几分钟很常见），只要 Ghostscript\n")
+		fmt.Fprintf(os.Stderr, "  仍在输出页进度就不会被打断；只有连续无任何输出达到 -timeout 秒数时才\n")
+		fmt.Fprintf(os.Stderr, "  判定为卡死，跳过该文件并保留原文件（不影响其他文件）。\n")
+		fmt.Fprintf(os.Stderr, "  个别重度损坏的文件会让 gs 长时间无输出，该保护可避免整批任务被拖住。\n")
 		fmt.Fprintf(os.Stderr, "\n%s\n", author)
 	}
 
 	// 重排参数：选项可出现在位置参数前后任意位置（如 文件.pdf -level screen）
 	os.Args = reorderArgs(os.Args)
 	flag.Parse()
+
+	// 停滞超时配置（0 = 关闭卡死保护）。
+	// 首次输出阈值正常为 60s，避免用户设了很小的 -timeout 时反被它拖慢。
+	if *timeoutSec > 0 {
+		stallTimeout = time.Duration(*timeoutSec) * time.Second
+		firstOutputTimeout = 60 * time.Second
+		if firstOutputTimeout > stallTimeout {
+			firstOutputTimeout = stallTimeout
+		}
+	} else {
+		stallTimeout = 0
+	}
 
 	if *showVersion {
 		fmt.Printf("PDFCompress v%s\n", version)

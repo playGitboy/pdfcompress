@@ -28,6 +28,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"sort"
 )
 
 // geomKind 描述页面几何属于哪一类
@@ -121,6 +122,14 @@ type pdfGeom struct {
 	hasImage bool
 	// 页面宽高的原始值样本（用于调试/日志）
 	sampleW, sampleH float64
+	// readDegraded：探测时对文件头/尾窗口的读取未能完整完成
+	// （短读或 Seek 失败，重试后仍不完整）。
+	//
+	// 为什么必须记下来：本函数是「尽力而为」——读取不全时解析会静默退化，
+	// 本该启用几何修正的「像素当 pt」扫描件会被归入 std 分组，
+	// 于是压缩率骤降且没有任何迹象。调用方据此给出行提示，
+	// 而不是把「探测不到」误当成「无需修正」。
+	readDegraded bool
 }
 
 // 判定是否需要对该 PDF 启用「几何基准修正」
@@ -399,11 +408,20 @@ func hasImageObjects(data []byte) bool {
 // 因此采用「头 4MiB + 尾 4MiB」双窗口扫描：
 //   - 头部覆盖常规 PDF；尾部覆盖「页面对象后置」型 PDF；
 //   - 两窗口之间有重叠区去重（见 probePDFGeom），不会重复计页。
+//
 // 单文件最多读 8MiB，比整文件读入（最大实测 62MB）节省一个数量级的内存与 IO。
 const (
 	geomScanHead = 4 << 20 // 头部窗口 4 MiB
 	geomScanTail = 4 << 20 // 尾部窗口 4 MiB
 )
+
+// 窗口读取的重试次数。
+//
+// 为什么要重试：扫描件常存放在网络盘 / USB / 移动硬盘上，也可能被杀软
+// 实时扫描而短暂占用。这类环境下 f.Read 偶发短读或返回瞬时错误，
+// 一旦发生在几何探测阶段，就会让该文件静默失去几何修正（见 readDegraded）。
+// 重试一次即可消除绝大多数瞬时失败，成本近乎为零。
+const readAttempts = 2
 
 // probePDFGeom 探测一个 PDF 文件的页面几何信息。
 // 任何错误都不返回 error，而是返回 kind=geomUnknown，保证不影响主流程。
@@ -425,36 +443,42 @@ func probePDFGeom(path string) pdfGeom {
 
 	// ---- 双窗口读取：头部 + 尾部 ----
 	// short 文件直接整读；长文件读头尾各 4MiB（中间大段是图像流，无需扫描）。
+	// 读取不完整会重试一次；重试后仍不完整则记 degraded，
+	// 由调用方提示「该文件的几何判定可能失真」，避免静默降质。
 	var head, tail []byte
 	var headOff, tailOff int64
+	degraded := false
 	if size <= int64(geomScanHead+geomScanTail) {
-		all := make([]byte, size)
-		n, _ := readFull(f, all)
-		if n <= 0 {
+		data, full := readWindow(f, 0, int(size))
+		if len(data) == 0 {
 			return pdfGeom{kind: geomUnknown}
 		}
-		head = all[:n]
+		head = data
 		headOff = 0
-		tail = nil
+		if !full {
+			degraded = true
+		}
 	} else {
-		hb := make([]byte, geomScanHead)
-		hn, _ := readFull(f, hb)
-		if hn <= 0 {
+		hb, hFull := readWindow(f, 0, geomScanHead)
+		if len(hb) == 0 {
 			return pdfGeom{kind: geomUnknown}
 		}
-		head = hb[:hn]
+		head = hb
 		headOff = 0
+		if !hFull {
+			degraded = true
+		}
 
 		tailOff = size - int64(geomScanTail)
-		if _, err := f.Seek(tailOff, 0); err != nil {
-			// 尾部不可读时，退化为仅头部扫描
-			tail = nil
+		tb, tFull := readWindow(f, tailOff, geomScanTail)
+		if len(tb) > 0 {
+			tail = tb
 		} else {
-			tb := make([]byte, geomScanTail)
-			tn, _ := readFull(f, tb)
-			if tn > 0 {
-				tail = tb[:tn]
-			}
+			// 尾部完全读不到：退化为仅头部扫描；偏移不再有意义
+			tailOff = 0
+		}
+		if !tFull {
+			degraded = true
 		}
 	}
 
@@ -470,7 +494,7 @@ func probePDFGeom(path string) pdfGeom {
 	// 完全没有明文 MediaBox：可能整份页面对象都在压缩对象流(ObjStm)里。
 	// 这类文件无法用明文扫描拿到页面尺寸 → 保守返回 geomUnknown（不改动）。
 	if len(pages) == 0 {
-		return pdfGeom{kind: geomUnknown}
+		return pdfGeom{kind: geomUnknown, readDegraded: degraded}
 	}
 
 	// 统计各尺寸出现情况，取「出现次数最多」的尺寸作为该文件的主尺寸。
@@ -490,24 +514,44 @@ func probePDFGeom(path string) pdfGeom {
 		}
 		counts[key{int(a + 0.5), int(b + 0.5)}]++
 	}
-	var mainW, mainH float64
-	bestN := -1
-	for k, c := range counts {
-		if c > bestN {
-			bestN = c
-			mainW, mainH = float64(k.short), float64(k.long)
-		}
+
+	// 选出主尺寸。
+	//
+	// ⚠ 必须显式排序后再取，绝不能直接 range map：
+	// Go 的 map 遍历顺序是随机的，当多个尺寸的出现次数**并列**时
+	// （混排文档极常见，例如仅 2 页却有 2 种尺寸），随机胜出会让
+	// 「同一文件、同一输入」在不同运行中被判成不同几何类别 →
+	// 分到不同压缩策略分组 → 输出体积忽大忽小、结果不可复现。
+	// 实测：test (104).pdf 连探 20 次，16 次判 fix:A4、4 次判 std（两页两种尺寸，并列）。
+	//
+	// 并列时的确定性规则：先比页数（多者优先），再比长边（大者优先）。
+	// 「大者优先」贴合本函数用途 —— 像素当 pt 的扫描页尺寸远大于标准纸张，
+	// 并列时优先选中它，才不会漏掉真正需要几何修正的扫描件。
+	keys := make([]key, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
 	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] != counts[keys[j]] {
+			return counts[keys[i]] > counts[keys[j]]
+		}
+		if keys[i].long != keys[j].long {
+			return keys[i].long > keys[j].long
+		}
+		return keys[i].short > keys[j].short
+	})
+	mainW, mainH := float64(keys[0].short), float64(keys[0].long)
 
 	g := classifyPage(mainW, mainH)
 	res := pdfGeom{
-		kind:     g.kind,
-		paper:    g.paper,
-		pages:    len(pages),
-		uniform:  len(counts) == 1,
-		hasImage: hasImageObjects(data),
-		sampleW:  mainW,
-		sampleH:  mainH,
+		kind:         g.kind,
+		paper:        g.paper,
+		pages:        len(pages),
+		uniform:      len(counts) == 1,
+		hasImage:     hasImageObjects(data),
+		sampleW:      mainW,
+		sampleH:      mainH,
+		readDegraded: degraded,
 	}
 
 	// 探测方向混排：存在既是竖版又是横版的页面
@@ -541,6 +585,37 @@ func probePDFGeom(path string) pdfGeom {
 	}
 
 	return res
+}
+
+// readWindow 从文件 off 偏移处读取至多 want 字节。
+//
+// 与直接 readFull 的区别：读取出错或短读时会重试（最多 readAttempts 次），
+// 用于消除网络盘 / 杀软扫描造成的瞬时读取中断。
+//
+// 返回值：
+//
+//	data     —— 实际读到的字节（最长 want，可能更短）
+//	complete —— 是否一次读满 want 字节。false 表示重试后仍不完整，
+//	            调用方应把结果标记为「探测降级」而不是当成完整解析。
+func readWindow(f *os.File, off int64, want int) (data []byte, complete bool) {
+	if want <= 0 {
+		return nil, true
+	}
+	buf := make([]byte, want)
+	best := 0
+	for attempt := 0; attempt < readAttempts; attempt++ {
+		if _, err := f.Seek(off, 0); err != nil {
+			continue
+		}
+		n, err := readFull(f, buf)
+		if n > best {
+			best = n
+		}
+		if err == nil && n == want {
+			return buf, true
+		}
+	}
+	return buf[:best], false
 }
 
 // readFull 读取至多 len(buf) 字节，返回实际读取数。

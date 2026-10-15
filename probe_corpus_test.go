@@ -32,17 +32,17 @@ func TestProbeCorpusDir(t *testing.T) {
 	sort.Strings(files)
 
 	type row struct {
-		name                 string
-		size                 int64
-		kind                 string
-		paper                string
-		pages                int
-		unif                 bool
-		mixed                bool
-		hasImg               bool
-		fix                  bool
-		sw, sh               float64
-		tw, th               float64
+		name   string
+		size   int64
+		kind   string
+		paper  string
+		pages  int
+		unif   bool
+		mixed  bool
+		hasImg bool
+		fix    bool
+		sw, sh float64
+		tw, th float64
 	}
 	var rows []row
 	nFix, nStd, nUnk := 0, 0, 0
