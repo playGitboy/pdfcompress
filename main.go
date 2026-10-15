@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	version = "2.3.0"
+	version = "2.4.0"
 	author  = "https://github.com/playgitboy"
 )
 
@@ -101,6 +101,18 @@ func parseLevel(s string) CompressLevel {
 		}
 		return LevelEBook
 	}
+}
+
+// validLevel 判断 -level 取值是否能被识别（内置档位名或 10-2400 的自定义 DPI）。
+// 用于对无效输入给出提示，而不是静默回退到 ebook —— 静默回退会让用户
+// 以为指定生效了，实际档位与预期不符。
+func validLevel(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "screen", "ebook", "printer", "prepress":
+		return true
+	}
+	dpi, err := strconv.Atoi(s)
+	return err == nil && dpi >= 10 && dpi <= 2400
 }
 
 func levelName(l CompressLevel) string {
@@ -260,7 +272,7 @@ func baseGSArgs() []string {
 // 因为几何基准修正参数是进程级的（见 compressChunk 注释）。
 //
 //	"std"                   —— 标准纸张或无法判定：沿用原有参数，"行为与旧版完全一致"
-//	"fix:A4:631.5x842.0" 等 —— 像素当 pt 扫描件：启用 FIXEDMEDIA/FitPage/-r 修正
+//	"fix:A4:P:631.5x842.0" 等 —— 像素当 pt 扫描件：启用 FIXEDMEDIA/FitPage/-r 修正
 //
 // ⚠ 键里必须带上「目标页面尺寸」，不能只带纸张名。
 // 原因：目标尺寸由 targetPageSize 按**原始长宽比**反算（见该函数注释），
@@ -269,6 +281,11 @@ func baseGSArgs() []string {
 // chunk[0] 的页面尺寸 —— 其中一份会被加上多余白边，且压缩率随「邻居是谁」漂移。
 // 带上尺寸后，任一文件的处理参数只由自身决定，与批次组成无关，
 // 也与「单文件模式」的结果完全一致。
+//
+// ⚠ 键里还必须带上方向（P=竖版 / L=横版）。
+// targetPageSize 返回的是竖版视角的 (短边, 长边)；横版文件在 geometryArgs 中
+// 会把宽高对调。若不把方向写进分组键，竖版与横版文件会被归入同一进程，
+// 而设备宽高是进程级参数，必然有一方被套错方向、内容被缩放留白。
 func geomGroupKey(g pdfGeom) string {
 	if !g.shouldFixGeometry() {
 		return "std"
@@ -277,8 +294,12 @@ func geomGroupKey(g pdfGeom) string {
 	if name == "" {
 		name = "A4"
 	}
+	orient := "P"
+	if g.landscape {
+		orient = "L"
+	}
 	pw, ph := targetPageSize(g)
-	return fmt.Sprintf("fix:%s:%.1fx%.1f", name, pw, ph)
+	return fmt.Sprintf("fix:%s:%s:%.1fx%.1f", name, orient, pw, ph)
 }
 
 // 用于「几何基准修正」时通过 -r 重设 gs 的 DPI 基准。
@@ -321,6 +342,11 @@ func geometryArgs(g pdfGeom, level CompressLevel) []string {
 	}
 	dpi := levelDPI(level)
 	pw, ph := targetPageSize(g)
+	// 保持原始页面方向：targetPageSize 返回竖版视角的 (短边, 长边)，
+	// 横版文件需对调，否则横版内容会被压进竖版页面、上下留大片白边。
+	if g.landscape {
+		pw, ph = ph, pw
+	}
 	return []string{
 		"-dFIXEDMEDIA",
 		"-dPDFFitPage",
@@ -356,6 +382,27 @@ func fileSize(path string) int64 {
 func validOutput(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Size() > 0
+}
+
+// samePath 判断两个路径是否指向同一个文件/目录。
+// 优先用 os.Stat + os.SameFile（可识别符号链接、相对/绝对、硬链接、
+// Windows 大小写差异）；目标尚不存在时退回绝对路径比较。
+func samePath(a, b string) bool {
+	if ai, aerr := os.Stat(a); aerr == nil {
+		if bi, berr := os.Stat(b); berr == nil {
+			return os.SameFile(ai, bi)
+		}
+	}
+	aa, aerr := filepath.Abs(a)
+	bb, berr := filepath.Abs(b)
+	if aerr != nil || berr != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	aa, bb = filepath.Clean(aa), filepath.Clean(bb)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(aa, bb) // Windows 文件系统不区分大小写
+	}
+	return aa == bb
 }
 
 // sOutputFileValue 处理 -sOutputFile= 取值：
@@ -791,13 +838,22 @@ func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
 // skip 为需要跳过的目录集合（输出目录），避免二次运行时把上一次的输出当成输入。
 // 优化：不再对每个条目调用 filepath.Abs（其内部会触发 os.Getwd 系统调用），
 // 改为比较 Clean 后的路径，避免 O(N) 次系统调用。
-func findPDFs(root string, recursive bool, skip map[string]bool) ([]string, error) {
+func findPDFs(root string, recursive bool, skip map[string]bool) ([]string, []string, error) {
 	var pdfs []string
+	var unreadable []string
 
 	if recursive {
-		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
+		cleanRoot := filepath.Clean(root)
+		err := filepath.Walk(root, func(path string, info os.FileInfo, werr error) error {
+			if werr != nil {
+				// 根目录本身不可读：必须报错（否则会静默退化为「未找到PDF」）
+				if filepath.Clean(path) == cleanRoot {
+					return werr
+				}
+				// 单个子目录/文件不可读（权限、临时占用、坏符号链接等）：
+				// 记录并跳过，不能因为一个坏目录就放弃整批文件。
+				unreadable = append(unreadable, path)
+				return nil
 			}
 			if info.IsDir() {
 				if skip[filepath.Clean(path)] {
@@ -811,12 +867,12 @@ func findPDFs(root string, recursive bool, skip map[string]bool) ([]string, erro
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, unreadable, err
 		}
 	} else {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, e := range entries {
 			if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".pdf") {
@@ -826,7 +882,7 @@ func findPDFs(root string, recursive bool, skip map[string]bool) ([]string, erro
 	}
 
 	sort.Strings(pdfs) // 固定顺序，便于结果对照与复现
-	return pdfs, nil
+	return pdfs, unreadable, nil
 }
 
 // exitAfterPause 退出程序。若为双击/拖放启动，先等待用户回车，
@@ -851,6 +907,15 @@ func pause() {
 
 // 压缩单个PDF并输出结果，返回是否成功
 func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quiet bool, gsThreads int) bool {
+	// 非覆盖模式下输出路径不能指向输入文件本身：否则 gs 会把结果写回它正在读入的
+	// 源文件，静默丢失原文件（实测 47KB 输入被 3KB 输出直接替换）。
+	// 这属于必须拦截的数据丢失路径。
+	if !overwrite && samePath(input, output) {
+		fmt.Fprintf(os.Stderr, "错误: 输出文件与输入文件相同（%s）\n", output)
+		fmt.Fprintln(os.Stderr, "      非覆盖模式会直接改写源文件；请指定不同的 -o 路径，或改用 -overwrite。")
+		return false
+	}
+
 	start := time.Now()
 	origSize := fileSize(input)
 
@@ -1017,6 +1082,17 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		workers = 1
 	}
 
+	// 非覆盖模式下，输出目录 == 输入目录是一条数据丢失路径：
+	// gs 会被要求把结果写回它正在读入的源文件。实测小文件被静默替换
+	// （原文件直接丢失），大文件则可能在读到一半时被截断而损坏。
+	// 必须在扫描前拦下，绝不静默改写源文件。
+	if !overwrite && samePath(absOut, absDir) {
+		fmt.Fprintf(os.Stderr, "错误: 输出目录与输入目录相同（%s）\n", absOut)
+		fmt.Fprintln(os.Stderr, "      非覆盖模式会直接改写源文件；请用 -out 指定不同的输出目录，")
+		fmt.Fprintln(os.Stderr, "      或改用 -overwrite 明确表示要以压缩结果覆盖原文件。")
+		return -1
+	}
+
 	if !quiet {
 		fmt.Printf("扫描目录: %s\n", absDir)
 		if overwrite {
@@ -1039,15 +1115,54 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		skipDirs[filepath.Clean(absOut)] = true
 	}
 
-	pdfs, err := findPDFs(absDir, recursive, skipDirs)
+	pdfs, unreadable, err := findPDFs(absDir, recursive, skipDirs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "扫描文件失败: %v\n", err)
 		return -1
+	}
+	// 个别子目录/文件不可读时只跳过并提示，不让整批任务失败。
+	if len(unreadable) > 0 {
+		fmt.Fprintf(os.Stderr, "[提示] 有 %d 个目录/文件无法读取，已跳过：\n", len(unreadable))
+		for _, u := range unreadable {
+			fmt.Fprintf(os.Stderr, "  - %s\n", truncName(u, 80))
+		}
+		fmt.Fprintln(os.Stderr)
 	}
 	if len(pdfs) == 0 {
 		fmt.Println("未找到PDF文件")
 		return 0
 	}
+
+	// 几何探测：并行完成（每个文件最多读 8MiB）。
+	// 大目录下探测是纯 IO 等待，串行会造成明显的前置延迟；并行度取较小值（4），
+	// 兼顾机械盘/网络盘上的顺序读性能与内存占用（每路峰值约 8MiB）。
+	geoms := make([]pdfGeom, len(pdfs))
+	probeWorkers := workers
+	if probeWorkers > 4 {
+		probeWorkers = 4
+	}
+	if probeWorkers > len(pdfs) {
+		probeWorkers = len(pdfs)
+	}
+	if probeWorkers < 1 {
+		probeWorkers = 1
+	}
+	var probeIdx int32
+	var probeWg sync.WaitGroup
+	for pw := 0; pw < probeWorkers; pw++ {
+		probeWg.Add(1)
+		go func() {
+			defer probeWg.Done()
+			for {
+				i := int(atomic.AddInt32(&probeIdx, 1)) - 1
+				if i >= len(pdfs) {
+					return
+				}
+				geoms[i] = probePDFGeom(pdfs[i])
+			}
+		}()
+	}
+	probeWg.Wait()
 
 	// 构造任务并预建输出目录（原实现每个文件都 MkdirAll 一次）
 	tasks := make([]*fileTask, 0, len(pdfs))
@@ -1075,7 +1190,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		// 几何探测：决定该文件属于哪个压缩策略分组。
 		// 标准纸张/无法判定 → "std"（沿用原参数，行为不变）
 		// 像素当 pt 扫描件    → "fix:<纸张>"（启用几何基准修正）
-		t.geom = probePDFGeom(p)
+		t.geom = geoms[i]
 		t.geomKey = geomGroupKey(t.geom)
 		if t.geom.readDegraded {
 			geomDegraded = append(geomDegraded, rel)
@@ -1552,6 +1667,10 @@ func main() {
 	}
 
 	compressLevel := parseLevel(*level)
+	if !validLevel(*level) {
+		fmt.Fprintf(os.Stderr, "[警告] 未识别的压缩级别 %q，已回退为默认的 ebook（150 DPI）。\n", *level)
+		fmt.Fprintln(os.Stderr, "       可用值: screen / ebook / printer / prepress，或 10-2400 的自定义 DPI 数值。")
+	}
 	for _, a := range flag.Args() {
 		if lvl, ok := bareLevel(a); ok {
 			compressLevel = lvl

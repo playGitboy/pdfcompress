@@ -112,8 +112,18 @@ type pdfGeom struct {
 	// 是否所有页面都是同一尺寸（忽略方向差异，见 probePDFGeom 中的说明）
 	uniform bool
 	// 是否混排方向：既有竖版又有横版页面。
-	// 影响修正策略：混排时不能只用一个目标纸张，见 geometryArgs。
+	// 影响修正策略：gs 的 FIXEDMEDIA 是「整份文件一个页面尺寸」，无法按页切换，
+	// 因此混排文件只能按**多数方向**设置目标页面（见 landscape）。
+	// 少数方向的页面会被 PDFFitPage 等比缩放后居中（上下或左右留白），
+	// 但比例与内容完整，不会拉伸变形。
 	mixedOrientation bool
+	// landscape：主尺寸页面是否以横版为主（长边作宽）。
+	//
+	// 修正时必须保持原始方向：若把横版扫描件强行套进竖版纸张，
+	// 内容会被等比缩小到页面宽度、上下各留一大片白边（实测横版 A4 内容
+	// 在竖版页面上只剩约 70% 线性尺寸）。按原方向设置目标页面后，
+	// 横版内容可铺满整个页面，压缩率与观感同时更好。
+	landscape bool
 	// hasImage：文件中是否含图像对象(XObject/Image 或内联图像)。
 	// 用途：几何基准修正的唯一收益是「让 gs 重新降采样图像」。
 	// 对纯文字 PDF（无图像）该修正毫无收益，反而会因页面结构改写导致
@@ -363,27 +373,58 @@ func relNear(a, b float64) bool {
 }
 
 // hasImageObjects 判断 PDF 是否含图像，采用最宽松的判据（命中任一即算含图）：
-//   - XObject 图像：/Subtype/Image 或 /Subtype /Image
-//   - 内联图像：BI ... ID ... EI（PDF 1.0+ 的内联图像语法）
+//   - XObject 图像：/Subtype/Image 或 /Subtype /Image（允许任意空白/换行）
+//   - 内联图像：BI ... ID（PDF 1.0+ 的内联图像语法，按 token 边界识别）
 //
 // 宁可漏判为「含图」（多跑一次修正）也不要漏判为「无图」
 // —— 漏判会让真正需要降采样的扫描件失去修正机会。
 func hasImageObjects(data []byte) bool {
-	if bytes.Contains(data, []byte("/Subtype/Image")) ||
-		bytes.Contains(data, []byte("/Subtype /Image")) {
-		return true
-	}
-	// 内联图像：BI 与 ID 之间通常有少量参数，用窗口近似匹配
-	if i := bytes.Index(data, []byte("BI")); i >= 0 {
-		win := data[i:]
-		if len(win) > 256 {
-			win = win[:256]
+	return hasSubtypeImage(data) || hasInlineImage(data)
+}
+
+// hasSubtypeImage 查找 /Subtype 后紧跟 /Image（允许任意空白与换行）。
+// 兼容 /Subtype/Image 与 /Subtype /Image 两种写法。
+func hasSubtypeImage(data []byte) bool {
+	key := []byte("/Subtype")
+	from := 0
+	for {
+		i := bytes.Index(data[from:], key)
+		if i < 0 {
+			return false
 		}
-		if bytes.Contains(win, []byte("ID")) {
+		p := skipSpace(data, from+i+len(key))
+		from = p
+		if p < len(data) && data[p] == '/' {
+			p++
+		}
+		if bytes.HasPrefix(data[p:], []byte("Image")) {
+			// 确保是完整的名字 token，避免误配 /ImageMaskFoo 之类
+			end := p + len("Image")
+			if end >= len(data) || isDelim(data[end]) {
+				return true
+			}
+		}
+	}
+}
+
+// hasInlineImage 按 token 边界查找内联图像 "BI ... ID"。
+// 窗口限制：BI 与 ID 之间是内联图像参数字典，正常远小于 512 字节。
+func hasInlineImage(data []byte) bool {
+	from := 0
+	for {
+		i := indexToken(data, "BI", from)
+		if i < 0 {
+			return false
+		}
+		from = i + 2
+		win := data[from:]
+		if len(win) > 512 {
+			win = win[:512]
+		}
+		if indexToken(win, "ID", 0) >= 0 {
 			return true
 		}
 	}
-	return false
 }
 
 // ---------- PDF 解析部分 ----------
@@ -554,19 +595,24 @@ func probePDFGeom(path string) pdfGeom {
 		readDegraded: degraded,
 	}
 
-	// 探测方向混排：存在既是竖版又是横版的页面
-	hasPortrait, hasLandscape := false, false
+	// 统计方向：单独统计「竖版 / 横版」页数，用于
+	//  1) 探测方向混排；
+	//  2) 决定修正时目标页面的方向（多数方向优先）。
+	// 混排时若取错方向，占多数的页面反而会被留白，因此以多数为准。
+	var nPortrait, nLandscape int
 	for _, s := range pages {
 		if s.w <= 0 || s.h <= 0 {
 			continue
 		}
 		if s.h >= s.w {
-			hasPortrait = true
+			nPortrait++
 		} else {
-			hasLandscape = true
+			nLandscape++
 		}
 	}
-	res.mixedOrientation = hasPortrait && hasLandscape
+	res.mixedOrientation = nPortrait > 0 && nLandscape > 0
+	// 并列时取竖版（保守默认，与历史行为一致）。
+	res.landscape = nLandscape > nPortrait
 
 	// 混合尺寸文件：只有「异常页面占多数」才整体修正；
 	// 少数异常页面不动（避免把正常文档搞坏）。
@@ -781,49 +827,78 @@ func findMediaBoxRefs(data []byte) []mbRef {
 			continue
 		}
 		q := np
-		for q < len(data) && isSpace(data[q]) {
-			q++
-		}
-		gen, q2, ok := parseUintAt(data, q)
+		q = skipSpace(data, q)
+		_, q2, ok := parseUintAt(data, q)
 		if !ok {
 			continue
 		}
-		q = q2
-		for q < len(data) && isSpace(data[q]) {
-			q++
-		}
-		if q < len(data) && data[q] == 'R' && gen == 0 {
+		q = skipSpace(data, q2)
+		if q < len(data) && data[q] == 'R' {
 			refs = append(refs, mbRef{num: int(num), pos: mbStart})
 		}
 	}
 	return refs
 }
 
-// findObjectArray 查找 "<objnum> 0 obj ... [ a b c d ]" 中的数组
+// findObjectArray 查找 "<objnum> <gen> obj ... [ a b c d ]" 中的数组。
+//
+// 相比原来的字面量匹配 "<num> 0 obj"，这里按 PDF token 解析：
+//   - 允许对象头内任意空白（空格/制表/换行）分隔，如 "7  0  obj"、"7\n0\nobj"；
+//   - 允许任意 generation（不限于 0）；
+//   - 对象号自带 token 边界，"17 0 obj" 不会被误配到对象 7。
+//
+// 数组部分取对象体内**第一个能解析成四个数**的 '[' 数组，
+// 避免命中对象头里可能出现的其它非数值数组。
 func findObjectArray(data []byte, objnum int) (pageSize, bool) {
-	// 构造 "<num> 0 obj"
-	pat := []byte(itoa(objnum) + " 0 obj")
-	i := bytes.Index(data, pat)
-	if i < 0 {
+	numTok := itoa(objnum)
+	from := 0
+	for {
+		i := indexToken(data, numTok, from)
+		if i < 0 {
+			return pageSize{}, false
+		}
+		from = i + len(numTok)
+
+		// "num gen obj"
+		q := skipSpace(data, from)
+		_, np, ok := parseUintAt(data, q)
+		if !ok {
+			continue
+		}
+		q = skipSpace(data, np)
+		if !bytes.HasPrefix(data[q:], []byte("obj")) {
+			continue
+		}
+		endObj := q + len("obj")
+		if endObj < len(data) && !isDelim(data[endObj]) {
+			continue
+		}
+		q = endObj
+
+		// 对象体内第一个可解析为四数的数组
+		win := data[q:]
+		if len(win) > 4096 {
+			win = win[:4096]
+		}
+		for s := bytes.IndexByte(win, '['); s >= 0; {
+			e := s + 1
+			for e < len(win) && win[e] != ']' {
+				e++
+			}
+			if e >= len(win) {
+				return pageSize{}, false
+			}
+			if sz, ok := parseFourFloats(win[s+1 : e]); ok {
+				return sz, true
+			}
+			off := bytes.IndexByte(win[e+1:], '[')
+			if off < 0 {
+				return pageSize{}, false
+			}
+			s = e + 1 + off
+		}
 		return pageSize{}, false
 	}
-	// 从该位置向后找第一个 '[' 数组（限制搜索窗口，避免跨对象误匹配）
-	win := data[i:]
-	if len(win) > 4096 {
-		win = win[:4096]
-	}
-	s := bytes.IndexByte(win, '[')
-	if s < 0 {
-		return pageSize{}, false
-	}
-	e := s + 1
-	for e < len(win) && win[e] != ']' {
-		e++
-	}
-	if e >= len(win) {
-		return pageSize{}, false
-	}
-	return parseFourFloats(win[s+1 : e])
 }
 
 // parseFourFloats 解析 "a b c d" 四个数，返回宽高（x1-x0, y1-y0）
@@ -959,4 +1034,49 @@ func itoa(n int) string {
 // isSpace PDF 中用于分隔 token 的空白字符
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == 0
+}
+
+// isDelim 判断字节是否为 PDF token 分隔符（空白或 PDF 定界符）。
+func isDelim(c byte) bool {
+	if isSpace(c) {
+		return true
+	}
+	switch c {
+	case '(', ')', '<', '>', '[', ']', '{', '}', '/', '%':
+		return true
+	}
+	return false
+}
+
+// skipSpace 返回 data 中从 p 起跳过空白后的位置。
+func skipSpace(data []byte, p int) int {
+	for p < len(data) && isSpace(data[p]) {
+		p++
+	}
+	return p
+}
+
+// indexToken 在 data[from:] 中查找「独立 token」tok（前后均为空白或 PDF 定界符）。
+// 用于避免把 "7" 误配到 "17"、把 "obj" 误配到 "objective" 之类。
+// 找不到返回 -1。
+func indexToken(data []byte, tok string, from int) int {
+	needle := []byte(tok)
+	if len(needle) == 0 || from < 0 {
+		return -1
+	}
+	for from <= len(data)-len(needle) {
+		i := bytes.Index(data[from:], needle)
+		if i < 0 {
+			return -1
+		}
+		p := from + i
+		end := p + len(needle)
+		left := p == 0 || isDelim(data[p-1])
+		right := end == len(data) || isDelim(data[end])
+		if left && right {
+			return p
+		}
+		from = p + 1
+	}
+	return -1
 }
