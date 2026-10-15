@@ -147,9 +147,10 @@ Lower values mean smaller files but lower text clarity; for on-screen reading 72
   an un-subsetted embedded CJK font stream; the main win is **font subsetting**.
   Measured 15.43 MB → about 220 KB (**-98.6%**), and **all four levels produce nearly
   byte-identical output**. This is expected, not a malfunction.
-- **Image-heavy (scans)** — the four levels differ substantially. Downsampling only kicks in
-  when the source image resolution exceeds the target DPI; if it is already below the target,
-  images are **passed through losslessly** (which is why `printer` can be faster *and* larger).
+- **Image-heavy (scans)** — the four levels differ substantially. **Any image whose effective
+  resolution exceeds the target DPI is downsampled**, so a higher level keeps more detail and
+  produces a larger file (`printer` is therefore normally much larger than `ebook`). Images
+  already below the target are never upsampled, so they cannot inflate the output.
 
 ---
 
@@ -205,6 +206,51 @@ preventing ~6% stretch distortion that would happen if a 4:3 photo were forced i
 
 > This feature is **not applied to pure-text PDFs** (no images means no benefit, and rewriting
 > the page structure can actually increase size slightly).
+
+---
+
+## Image downsampling threshold fix (making the level DPI a real cap)
+
+### The problem: why do standard-A4 scans also refuse to compress?
+
+Scans with a normal A4 page size but **higher-resolution images** often show a compression ratio
+of ~0% at the default `ebook` (150 DPI) level. Two causes, both meaning the level DPI was never
+actually enforced:
+
+1. **`DownsampleThreshold` defaults to 1.5**, i.e. downsampling only happens when
+   "source resolution > target × 1.5". For a 200 DPI scan at the 150 DPI level:
+   `150 × 1.5 = 225 > 200` → **not a single pixel is dropped**.
+2. **JPEG pass-through** (`-dPassThroughJPEGImages=true`) then copies the untouched image
+   straight into the output, which ends up a few dozen to a few hundred bytes *larger* than the
+   source — the safety net marks it "not smaller" and keeps the original file. The user sees a
+   **0% compression ratio**.
+
+### The fix
+
+Lower the downsampling threshold to **1.0** in the base arguments (downsample whenever the
+source exceeds the target) and **disable JPEG pass-through** (force re-encoding at the target
+resolution):
+
+```
+-dColorImageDownsampleThreshold=1.0
+-dGrayImageDownsampleThreshold=1.0
+-dMonoImageDownsampleThreshold=1.0
+-dPassThroughJPEGImages=false
+```
+
+Only then do `screen`=72 / `ebook`=150 / `printer`=300 DPI actually mean what they say.
+
+### Measured results
+
+- 8 "won't compress" samples (200 DPI scans, A4): at `ebook` the result went from
+  **0% for all 8 files** to **7 of 8 effectively compressed, 42.2% overall**
+  (`test(2)` 2.68 MB→0.64 MB, `test(8)` 651 KB→170 KB).
+- Full corpus of 89 files / 948 MB: **947.40 MB → 169.70 MB (-82.1%)** versus
+  179.75 MB (-81.0%) before. **12 files lost 10.0 MB in total; the other 76 changed only by
+  ≤118 bytes (timestamps)** — **zero size regressions**. Runtime 4m04s → 4m31s (+11%).
+- Quality (rendered at 150 DPI, pixel-by-pixel): `test(2)` MAE 3.5/255, `test(8)` MAE 3.0/255
+  (visually indistinguishable); a **dense small-text table scan** (`test(1)`) shows MAE ≈ 12/255,
+  the inherent cost of 200→150 DPI downsampling — use `printer` for such files if fidelity matters.
 
 ---
 

@@ -20,6 +20,13 @@ var (
 	author  = "https://github.com/playgitboy"
 )
 
+// tableSepWidth 结果表格分隔线的宽度。
+//
+// Windows 7 的命令提示符窗口默认 80 列，且属性里最大宽度也受限（不像新系统
+// 可以随意拖宽），分隔线一旦超过窗口宽度就会被折行，看起来像多出一条横线，
+// 影响观感。原为 100 列，减 23 列后取 77，可完整容纳于 80 列窗口。
+const tableSepWidth = 77
+
 // launchedByDoubleClick 判断本次运行是否由「双击图标 / 拖放文件到图标」启动。
 //
 // 只有这种情况才需要在结束时等待回车，让用户看清输出；
@@ -171,8 +178,14 @@ func baseGSArgs() []string {
 		"-dQUIET",
 		"-dBATCH",
 		"-dAutoRotatePages=/None",
-		"-dPassThroughJPEGImages=true",
-		"-dPassThroughJPXImages=true",
+		// ⚠ 关闭 JPEG 透传是「压缩率≈0」的关键修复之一。
+		// 透传开启时，源图是 JPEG 且 gs 认为“无需重采样”时会把原图原样搬进输出，
+		// 档位形同虚设 —— 实测 200DPI 的手机/扫描仪 PDF，在 ebook(150) 档
+		// 压缩率恰好为 0%（输出比原文件还大几百字节，被安全网判为 KEEP）。
+		// 关闭后强制重新编码，配合下面的 DownsampleThreshold=1.0，
+		// 让真正超标的图像被降到目标分辨率，净收益远大于重编码开销。
+		"-dPassThroughJPEGImages=false",
+		"-dPassThroughJPXImages=false",
 		"-dDetectDuplicateImages=true",
 		"-dEmbedAllFonts=true", // 文字型PDF（内嵌大字体）压缩主力：子集化+嵌入
 		"-dCompressFonts=true",
@@ -180,6 +193,14 @@ func baseGSArgs() []string {
 		"-dDownsampleColorImages=true",
 		"-dDownsampleGrayImages=true",
 		"-dDownsampleMonoImages=true",
+		// ⚠ DownsampleThreshold 默认 1.5，含义是「源分辨率 > 目标×1.5 才降采样」。
+		// ebook(150DPI) 遇到 200DPI 扫描件时 150×1.5=225 > 200 → 不降采样 →
+		// 图像一个像素都没少，压缩率自然接近 0。
+		// 设为 1.0：只要高于目标分辨率就降采样，使「档位 DPI」成为真正的上限，
+		// 与档位名称（screen 72 / ebook 150 / printer 300）的语义一致。
+		"-dColorImageDownsampleThreshold=1.0",
+		"-dGrayImageDownsampleThreshold=1.0",
+		"-dMonoImageDownsampleThreshold=1.0",
 		"-dColorImageDownsampleType=/Bicubic",
 		"-dGrayImageDownsampleType=/Bicubic",
 		"-dMonoImageDownsampleType=/Subsample", // 1bit 图像用 Subsample（Bicubic 不适用且更慢）
@@ -238,6 +259,7 @@ func levelDPI(level CompressLevel) int {
 //   - -dPassThroughJPEGImages=false：强制重编码。
 //     像素当 pt 的扫描件其原始 JPEG 往往已是「重编码过一次」的高质量样本，
 //     若仍允许透传，gs 会原样搬运、不做任何压缩。
+//     （该参数现已并入 baseGSArgs 全局生效，此处保留以表明本场景的强依赖关系。）
 //
 // 若该文件不需要修正（标准纸张/无图像/无法判定），返回 nil，调用方行为完全不变。
 func geometryArgs(g pdfGeom, level CompressLevel) []string {
@@ -816,7 +838,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		}
 		fmt.Printf("找到 %d 个PDF文件，开始压缩... [%s]\n\n", len(tasks), mode)
 		fmt.Printf("%-5s %-6s %10s %10s %8s  %s\n", "#", "状态", "原始", "压缩后", "压缩率", "文件")
-		fmt.Println(strings.Repeat("-", 100))
+		fmt.Println(strings.Repeat("-", tableSepWidth))
 	}
 
 	// 构建分块：按「几何分组」先归类，再在组内按体积轮转分配。
@@ -893,6 +915,12 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 	var wg sync.WaitGroup
 	var persistBroken int32 // 一旦发现本机单进程模式不可用，后续块直接走逐文件
 
+	// 进度提示：单进程批量模式下，一个块内的多个文件要等整个块跑完才会打印结果，
+	// 大文件场景下会「长时间没有任何输出」，用户容易误以为卡死。
+	// 因此块一开始就打印一行“开始处理”，让用户始终能看到进展。
+	var progressMu sync.Mutex
+	var startedChunks int32
+
 	for w := 0; w < par; w++ {
 		wg.Add(1)
 		go func() {
@@ -933,6 +961,15 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 				if atomic.LoadInt32(&persistBroken) == 1 {
 					runPerFile(chunk)
 					continue
+				}
+
+				// 块内多文件时先报进度，避免「长时间无输出」被误判为卡死
+				if !quiet && len(chunk) > 1 {
+					n := atomic.AddInt32(&startedChunks, 1)
+					progressMu.Lock()
+					fmt.Printf("  ... 开始第 %d/%d 批（%d 个文件，起始：%s）\n",
+						n, len(chunks), len(chunk), truncName(chunk[0].rel, 40))
+					progressMu.Unlock()
 				}
 
 				inputs := make([]string, len(chunk))
@@ -1038,7 +1075,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 	}
 
 	if !quiet {
-		fmt.Println(strings.Repeat("-", 100))
+		fmt.Println(strings.Repeat("-", tableSepWidth))
 		fmt.Println()
 		fmt.Println("=== 压缩完成 ===")
 		fmt.Printf("总文件数: %d\n", totalFiles)
