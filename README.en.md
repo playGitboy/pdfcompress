@@ -20,8 +20,11 @@ works well on both **image-heavy (scanned)** and **text-heavy (electronic docume
   no command line needed.
 - **Four compression levels** — `screen` / `ebook` / `printer` / `prepress`, to trade off
   size against clarity.
+- **Smart scan detection** — automatically detects PDFs where image pixels were written as
+  the page size (common with phone/scanner exports), corrects the page geometry basis, and
+  only then downsamples — so these files actually compress (see "Scan geometry auto-fix").
 - **Parallel speed-up** — worker count defaults to the CPU core count, combined with
-  single-process batching: 77 files / 593 MB measured at about 16 seconds.
+  single-process batching: 98 files / 948 MB measured at about 3.5 minutes.
 - **Safe overwrite** — `-overwrite` writes a temp file first and atomically replaces on
   success; **if the result is not smaller, the original is kept**. It never inflates or
   corrupts your files.
@@ -29,6 +32,8 @@ works well on both **image-heavy (scanned)** and **text-heavy (electronic docume
   missing output triggers reprocessing, so partial results are never reported as success.
 - **Self-contained & offline** — bundled portable Ghostscript on Linux; target machines need
   nothing pre-installed and no network access.
+- **Zero third-party dependencies** — geometry probing and argument assembly are pure Go
+  standard library.
 - **Error visibility** — on Windows, when launched by double-click, the program **waits for
   Enter even on errors**, so messages never flash by unseen.
 
@@ -141,6 +146,61 @@ pdfcompress -dir ./inbox -gs "C:\gs\bin\gswin32c.exe"
 
 ---
 
+## Scan geometry auto-fix
+
+### The problem: why do some scans refuse to compress?
+
+Phone photos and scanner exports often write the **image pixel count directly as the page size
+in points**. For example a 2736×3648 pixel photo becomes a 2736×3648 pt page (normal A4 is only
+595×842 pt).
+
+Ghostscript then computes the **effective DPI as 72** (2736 px ÷ (2736 pt ÷ 72)), which is below
+every compression threshold, so it decides "no downsampling needed" — `screen` / `ebook` /
+`printer` outputs become **nearly byte-identical**, and the compression ratio is ~0. This is the
+real root cause of "big file but won't compress".
+
+### The fix: smart decision, not a blunt hammer
+
+The program includes a **zero-dependency plain-text geometry probe** (`pdfgeom.go`) that scans
+`/MediaBox` values and applies a **three-branch decision**:
+
+| Decision | Condition | Action |
+| --- | --- | --- |
+| **Standard paper** | Matches A4 / A3 / A5 / Letter / Legal etc. | **No change at all**; uses original logic |
+| **Pixel-as-point** | Oversized (long edge > 1300 pt) **and** contains images **and** abnormal pages are the majority | Enable geometry correction |
+| **Undetermined** | Parse failure / pages inside compressed object streams / custom size | **Conservative no-change**; uses original logic |
+
+When correction is enabled, `-dFIXEDMEDIA -dPDFFitPage` are injected to remap the page to the
+**closest standard paper by aspect ratio**, and `-r<level-DPI>` resets the resolution baseline so
+Ghostscript can compute the true DPI and downsample normally. The target size **preserves the
+original aspect ratio** (long edge maps to paper long edge, short edge is scaled proportionally),
+preventing ~6% stretch distortion that would happen if a 4:3 photo were forced into A4.
+
+### Measured results
+
+- 89 files / 948 MB real corpus: **83 standard (unchanged) / 4 pixel-as-point (fixed) / 2
+  conservative (unchanged)**.
+- The 4 fixed files now diverge across levels (previously almost identical):
+
+  | File | Source | screen | **ebook (default)** | printer |
+  | --- | --- | --- | --- | --- |
+  | test (1) | 18.39 MB | 188 KB | **753 KB** | 3.1 MB |
+  | test (63) | 24.51 MB | 285 KB | **1425 KB** | 1425 KB |
+  | test (64) | 23.33 MB | 108 KB | **337 KB** | 1091 KB |
+  | test (104) | 4.75 MB | 31 KB | **113 KB** | 290 KB |
+
+- **Zero impact on standard A4**: the same official document produces 271,669 bytes before and
+  after; the only byte differences are timestamps and document IDs, and the xref offset table is
+  byte-identical.
+- **Aspect deviation ≤ 0.04%** (pure rounding error).
+- Visual check: at the `ebook` level (~1/24 the size) titles and body text remain perfectly
+  readable.
+
+> This feature is **not applied to pure-text PDFs** (no images means no benefit, and rewriting
+> the page structure can actually increase size slightly).
+
+---
+
 ## Supported systems (all fully offline)
 
 | Platform | Architecture | Offline package | Requirements |
@@ -222,7 +282,10 @@ To change the company name, product name, description, etc., edit the `info` dic
 ## Dependencies
 
 - [Ghostscript](https://www.ghostscript.com/) — PDF rewriting engine (bundled in Linux packages)
-- [pdfcpu](https://github.com/pdfcpu/pdfcpu) v0.15.0 — PDF structure validation
+- [Ghostscript](https://www.ghostscript.com/) — the PDF rewriting engine (bundled in the
+  Linux offline packages)
+- **No other third-party dependencies** — geometry probing, argument assembly and batch
+  scheduling are pure Go standard library; `go.mod` only declares the module and Go version.
 
 ## Author
 
