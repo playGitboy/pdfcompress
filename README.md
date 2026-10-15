@@ -162,12 +162,35 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 如需进一步缩小体积，可用 UPX 加壳：
 
 ```bash
-upx -9 pdfcompress.exe      # 1.81 MB → 0.72 MB
+upx -9 pdfcompress.exe      # 2.09 MB → 1.04 MB（含图标与版本信息）
 upx -9 pdfcompress          # 1.77 MB → 0.66 MB (arm64)
 ```
 
 > UPX 加壳可能被部分国内杀毒软件误报，正式部署前请先做白名单验证。  
 > 加壳是无损可逆的：`upx -d` 解包后与原文件逐字节一致。
+
+### 为 Windows 版添加图标与版本信息
+
+Windows 版的图标和「属性 → 详细信息」由包目录下的 `winres.syso` 提供：
+Go 在构建 windows 目标时会自动链接同级目录中的 `*.syso`（COFF 目标文件）。
+这两个脚本**纯 Python 实现，不依赖 windres / mingw / go-winres**，可在离线环境使用：
+
+```bash
+# 1) PNG → 多尺寸 ICO（生成 app.ico，含 16/24/32/48/64/128/256 七个尺寸）
+python png2ico.py pdf.png app.ico
+
+# 2) ICO + 版本信息 → winres.syso
+python make_syso.py winres.syso app.ico 2.1.0
+
+# 3) 正常整包编译，资源会被自动嵌入
+CGO_ENABLED=0 GOOS=windows GOARCH=386 \
+  go build -trimpath -buildvcs=false -ldflags "-s -w" -o pdfcompress.exe
+```
+
+要改公司名、产品名、描述等，直接编辑 `make_syso.py` 中 `main()` 里的 `info` 字典即可。
+
+> 该脚本生成的是 32 位（i386）COFF，仅用于 `GOARCH=386` 的 Windows 构建。
+> Linux 版不需要、也不应放置 `winres.syso`。
 
 ---
 

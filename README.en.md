@@ -184,13 +184,38 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 To shrink further, pack with UPX:
 
 ```bash
-upx -9 pdfcompress.exe      # 1.81 MB → 0.72 MB
+upx -9 pdfcompress.exe      # 2.09 MB → 1.04 MB (icon + version info included)
 upx -9 pdfcompress          # 1.77 MB → 0.66 MB (arm64)
 ```
 
 > UPX packing can trigger false positives in some antivirus products — validate whitelisting
 > before deployment. Packing is lossless and reversible: `upx -d` restores a byte-identical
 > file.
+
+### Adding an icon and version info to the Windows build
+
+The Windows icon and the **Properties → Details** tab come from `winres.syso` in the package
+directory: Go automatically links any `*.syso` (a COFF object file) found there when building
+for Windows. Both helper scripts are **pure Python with no external dependencies** (no
+windres / mingw / go-winres), so they work in offline environments:
+
+```bash
+# 1) PNG -> multi-size ICO (16/24/32/48/64/128/256)
+python png2ico.py pdf.png app.ico
+
+# 2) ICO + version info -> winres.syso
+python make_syso.py winres.syso app.ico 2.1.0
+
+# 3) Normal whole-package build; the resources are embedded automatically
+CGO_ENABLED=0 GOOS=windows GOARCH=386 \
+  go build -trimpath -buildvcs=false -ldflags "-s -w" -o pdfcompress.exe
+```
+
+To change the company name, product name, description, etc., edit the `info` dict inside
+`main()` in `make_syso.py`.
+
+> The generated object is 32-bit (i386) COFF and is only valid for `GOARCH=386` Windows
+> builds. The Linux builds neither need nor should include `winres.syso`.
 
 ---
 

@@ -9,3 +9,6 @@
 *.pdf  binary
 *.zip  binary
 *.gz   binary
+*.ico  binary
+*.syso binary
+*.png  binary
