@@ -730,6 +730,20 @@ func detectGSVersion(gsExe string) (major, minor int, ok bool) {
 
 // 压缩单个PDF（每个文件一个 gs 进程）
 func compressFile(gsExe, input, output string, level CompressLevel, gsThreads int) error {
+	// 空文件 / 目录等显然不是合法 PDF 的输入，在调用 gs 前就给出明确错误。
+	//
+	// 尤其是 0 字节文件：Ghostscript 会“成功”写出一个 2KB 左右的空白 PDF
+	// 并以退出码 0 结束，仅凭体积安全网（输出不小于原件则 KEEP）会把它
+	// 判成「压缩成功」——对脚本/批处理是伪成功。必须在此拦下。
+	if fi, statErr := os.Stat(input); statErr == nil {
+		if fi.IsDir() {
+			return fmt.Errorf("输入路径是目录，不是 PDF 文件")
+		}
+		if fi.Size() == 0 {
+			return fmt.Errorf("源文件为空（0 字节，已保留原文件）")
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
 		return fmt.Errorf("创建输出目录失败: %v", err)
 	}
@@ -1312,6 +1326,13 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 
 			// 后处理：覆盖模式下用临时文件替换原文件；未变小时保留原文件
 			finalize := func(t *fileTask) fileResult {
+				// 空文件（0 字节，或 os.Stat 失败导致 orig=0）：gs 会成功写出一个
+				// 空白 PDF，仅凭体积安全网会把它算成 KEEP 成功。这里与
+				// compressFile 的守卫保持一致，直接判失败并清掉产物。
+				if t.orig == 0 {
+					os.Remove(t.writePath)
+					return fileResult{task: t, err: fmt.Errorf("源文件为空或无法读取（0 字节，已保留原文件）")}
+				}
 				compSize := fileSize(t.writePath)
 				if compSize <= 0 || compSize >= t.orig {
 					os.Remove(t.writePath)
