@@ -29,7 +29,7 @@ var (
 // 注入真实检测（GetConsoleProcessList），这样即使单独编译 main.go 也不会出错。
 var launchedByDoubleClick = func() bool { return false }
 
-// 压缩级别
+// 压缩级别。内置档位用 iota（0-3）；自定义 DPI 用 1000+dpi 编码。
 type CompressLevel int
 
 const (
@@ -38,6 +38,9 @@ const (
 	LevelPrinter                       // 300 DPI，打印质量
 	LevelPrepress                      // 300 DPI+，高质量
 )
+
+// customLevelBase 用于编码自定义 DPI 值，避免与内置 iota 冲突。
+const customLevelBase = 1000
 
 func parseLevel(s string) CompressLevel {
 	switch strings.ToLower(s) {
@@ -50,6 +53,10 @@ func parseLevel(s string) CompressLevel {
 	case "prepress":
 		return LevelPrepress
 	default:
+		// 尝试解析为自定义 PPI/DPI 数值（如 "100"）
+		if dpi, err := strconv.Atoi(s); err == nil && dpi >= 10 && dpi <= 2400 {
+			return CompressLevel(customLevelBase + dpi)
+		}
 		return LevelEBook
 	}
 }
@@ -65,11 +72,14 @@ func levelName(l CompressLevel) string {
 	case LevelPrepress:
 		return "prepress (300 DPI+，出版级)"
 	default:
+		if l >= customLevelBase {
+			return fmt.Sprintf("custom (%d DPI，用户自定义)", int(l)-customLevelBase)
+		}
 		return "unknown"
 	}
 }
 
-// levelSlug 返回用于输出文件名的压缩级别短名称（screen/ebook/printer/prepress）
+// levelSlug 返回用于输出文件名的压缩级别短名称（screen/ebook/printer/prepress/customXX）
 func levelSlug(l CompressLevel) string {
 	switch l {
 	case LevelScreen:
@@ -81,6 +91,9 @@ func levelSlug(l CompressLevel) string {
 	case LevelPrepress:
 		return "prepress"
 	default:
+		if l >= customLevelBase {
+			return fmt.Sprintf("custom%d", int(l)-customLevelBase)
+		}
 		return "compressed"
 	}
 }
@@ -95,6 +108,7 @@ func levelSlug(l CompressLevel) string {
 // -dJPEGQ=xx 亦已移除：它不是 pdfwrite 的合法参数，实测无论取值多少
 // 输出字节完全相同（无任何效果），保留只会误导。
 func gsSettings(level CompressLevel) []string {
+	// 内置级别
 	switch level {
 	case LevelScreen:
 		return []string{
@@ -120,12 +134,28 @@ func gsSettings(level CompressLevel) []string {
 			"-dGrayImageResolution=300",
 			"-dMonoImageResolution=1200",
 		}
-	default:
-		return []string{
-			"-dColorImageResolution=150",
-			"-dGrayImageResolution=150",
-			"-dMonoImageResolution=300",
+	}
+	// 自定义 DPI（10-2400）
+	if level >= customLevelBase {
+		dpi := int(level) - customLevelBase
+		mono := dpi * 2
+		if mono < 300 {
+			mono = 300
 		}
+		if mono > 2400 {
+			mono = 2400
+		}
+		return []string{
+			fmt.Sprintf("-dColorImageResolution=%d", dpi),
+			fmt.Sprintf("-dGrayImageResolution=%d", dpi),
+			fmt.Sprintf("-dMonoImageResolution=%d", mono),
+		}
+	}
+	// 默认 ebook
+	return []string{
+		"-dColorImageResolution=150",
+		"-dGrayImageResolution=150",
+		"-dMonoImageResolution=300",
 	}
 }
 
@@ -184,13 +214,13 @@ func levelDPI(level CompressLevel) int {
 		return 72
 	case LevelEBook:
 		return 150
-	case LevelPrinter:
+	case LevelPrinter, LevelPrepress:
 		return 300
-	case LevelPrepress:
-		return 300 // prepress 与 printer 同基准，差异仅在 MonoImageResolution
-	default:
-		return 150
 	}
+	if level >= customLevelBase {
+		return int(level) - customLevelBase
+	}
+	return 150
 }
 
 // geometryArgs 针对「像素当 pt」的扫描件，返回几何基准修正所需的额外参数。
@@ -1078,10 +1108,11 @@ func reorderArgs(args []string) []string {
 	return append([]string{args[0]}, append(flags, positionals...)...)
 }
 
-// bareLevel 识别位置参数中的压缩级别关键字
-// 支持: pdfcompress 文件.pdf screen
+// bareLevel 识别位置参数中的压缩级别关键字或自定义 DPI 数值
+// 支持: pdfcompress 文件.pdf screen / pdfcompress 文件.pdf 100
 func bareLevel(s string) (CompressLevel, bool) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
+	key := strings.ToLower(strings.TrimSpace(s))
+	switch key {
 	case "screen":
 		return LevelScreen, true
 	case "ebook":
@@ -1090,6 +1121,10 @@ func bareLevel(s string) (CompressLevel, bool) {
 		return LevelPrinter, true
 	case "prepress":
 		return LevelPrepress, true
+	}
+	// 自定义 DPI 数值
+	if dpi, err := strconv.Atoi(s); err == nil && dpi >= 10 && dpi <= 2400 {
+		return CompressLevel(customLevelBase + dpi), true
 	}
 	return 0, false
 }
@@ -1100,7 +1135,7 @@ func main() {
 	inputDir := flag.String("dir", "", "输入目录（批量模式）")
 	outputDir := flag.String("out", "", "输出目录（批量模式，默认在输入目录下创建compressed子目录）")
 	recursive := flag.Bool("r", false, "递归处理子目录")
-	level := flag.String("level", "ebook", "压缩级别: screen, ebook, printer, prepress")
+	level := flag.String("level", "ebook", "压缩级别: screen(72DPI), ebook(150DPI), printer(300DPI), prepress(300DPI+), 或自定义数值如 100")
 	workers := flag.Int("j", defaultWorkers(), "并发工作数（默认=CPU核数，上限16）")
 	gsThreads := flag.Int("gsThreads", 0, "每个Ghostscript进程的渲染线程数（0=按并发数自动）")
 	persist := flag.Bool("persist", true, "批量模式复用单个Ghostscript进程处理多个文件（显著提速）")

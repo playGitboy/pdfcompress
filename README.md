@@ -79,6 +79,9 @@ pdfcompress -dir ./待处理
 # 递归处理子目录，指定级别与并发数
 pdfcompress -dir ./待处理 -r -level printer -j 8
 
+# 自定义 DPI（如 100 PPI，适合需要比 ebook 更小体积的场景）
+pdfcompress -i 输入.pdf -level 100
+
 # 覆盖原文件（先写临时文件，成功后替换；未变小时保留原文件）
 pdfcompress -dir ./待处理 -overwrite
 
@@ -95,7 +98,7 @@ pdfcompress -dir ./待处理 -gs "C:\gs\bin\gswin32c.exe"
 | `-dir`       | 输入目录（批量模式）                                       | —                   |
 | `-out`       | 输出目录（批量模式）                                       | 输入目录下 `compressed/` |
 | `-r`         | 递归处理子目录                                          | `false`             |
-| `-level`     | 压缩级别：`screen` / `ebook` / `printer` / `prepress` | `ebook`             |
+| `-level`     | 压缩级别：`screen` / `ebook` / `printer` / `prepress`，或自定义 PPI 数值（如 `100`） | `ebook`             |
 | `-j`         | 并发工作数                                            | CPU 核数（上限 16）       |
 | `-gsThreads` | 每个 Ghostscript 进程的渲染线程数                          | `0`（按并发数自动）         |
 | `-persist`   | 批量模式复用单个 Ghostscript 进程（显著提速）                    | `true`              |
@@ -113,6 +116,10 @@ pdfcompress -dir ./待处理 -gs "C:\gs\bin\gswin32c.exe"
 | `ebook`    | 150 DPI               | **默认**。屏幕阅读，体积与清晰度的最佳平衡  |
 | `printer`  | 300 DPI               | 需要打印时使用，体积约为 ebook 的 3 倍 |
 | `prepress` | 300 DPI + 单色 1200 DPI | 印刷级，体积最大                 |
+| `10~2400`  | 自定义数值               | 如 `-level 100` 可在 screen 与 ebook 之间取折中 |
+
+**自定义 PPI 数值**：`-level` 支持直接传入 10–2400 的整数（如 `-level 100`）。  
+数值越小体积越小，但文字清晰度随之下降；建议屏幕阅读不低于 72，常规阅读不低于 100。
 
 **两类 PDF 的实际表现（实测）：**
 

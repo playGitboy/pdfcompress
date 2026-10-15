@@ -99,6 +99,9 @@ pdfcompress -dir ./inbox
 # Recurse, choose level and worker count
 pdfcompress -dir ./inbox -r -level printer -j 8
 
+# Custom DPI (e.g. 100 PPI, for a size between screen and ebook)
+pdfcompress -i input.pdf -level 100
+
 # Overwrite originals (temp file first, atomic replace; keep original if not smaller)
 pdfcompress -dir ./inbox -overwrite
 
@@ -115,7 +118,7 @@ pdfcompress -dir ./inbox -gs "C:\gs\bin\gswin32c.exe"
 | `-dir` | Input directory (batch mode) | — |
 | `-out` | Output directory (batch mode) | `compressed/` inside input dir |
 | `-r` | Recurse into subdirectories | `false` |
-| `-level` | Compression level: `screen` / `ebook` / `printer` / `prepress` | `ebook` |
+| `-level` | Compression level: `screen` / `ebook` / `printer` / `prepress`, or a custom PPI value (e.g. `100`) | `ebook` |
 | `-j` | Number of concurrent workers | CPU cores (max 16) |
 | `-gsThreads` | Render threads per Ghostscript process | `0` (auto) |
 | `-persist` | Reuse a single Ghostscript process in batch mode (major speed-up) | `true` |
@@ -133,6 +136,10 @@ pdfcompress -dir ./inbox -gs "C:\gs\bin\gswin32c.exe"
 | `ebook` | 150 DPI | **Default.** On-screen reading; best balance of size and clarity |
 | `printer` | 300 DPI | For printing; roughly 3× the size of ebook |
 | `prepress` | 300 DPI + mono 1200 DPI | Print-grade; largest size |
+| `10~2400` | Custom value | e.g. `-level 100` for a middle ground between screen and ebook |
+
+**Custom PPI values:** `-level` accepts an integer from 10 to 2400 (e.g. `-level 100`).  
+Lower values mean smaller files but lower text clarity; for on-screen reading 72 is the minimum, 100+ is recommended for regular use.
 
 **Measured behaviour on the two common PDF types:**
 
