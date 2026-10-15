@@ -31,7 +31,34 @@ import sys
 IMAGE_FILE_MACHINE_I386 = 0x014C
 IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
 IMAGE_SCN_MEM_READ = 0x40000000
-IMAGE_SCN_MEM_WRITE = 0x80000000
+
+# COFF 头 Characteristics：EXECUTABLE_IMAGE(0x0002) | 32BIT_MACHINE(0x0100)
+INFO_Characteristics = 0x0104
+
+# 节特征位：**照抄官方 rsrc.exe 的输出**，即 INITIALIZED_DATA | MEM_READ。
+# （实测 rsrc.exe 生成的是 0x40000040。曾误加 MEM_WRITE 得到 0xC0000040，
+#   也曾在错误的参考样本上学到 0xC2000070，二者都导致资源无法被 Windows 识别。）
+IMAGE_SCN_RSRC = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+
+# ⚠️⚠️⚠️ 资源必须放在**单个名为 ".rsrc" 的节**里。
+#
+# 这是从官方工具 rsrc.exe（github.com/akavel/rsrc，Go 社区标准方案）的输出
+# 反推出来的唯一正确形态：
+#     nsec=1, sec[0].name=".rsrc", VSize=0, RawSize=数据+重定位表,
+#     Characteristics=0x40000040, 符号表 1 项 ".rsrc"
+#
+# 曾经的错误尝试及后果：
+#   1) 节名 ".rsrc" + Ch=0xC0000040 + VSize=len(data)
+#      → 资源目录 RVA=0，链接器根本没登记资源，图标/版本全无
+#   2) 拆成 ".rsrc$01"(目录) + ".rsrc$02"(数据)
+#      → Go 的 addpersrc 对 ".rsrc$*" 会额外加 len(data)，
+#        数据 RVA 越过节尾（实测 0x245674 > 节尾 0x245600），
+#        Windows 同样读不到
+#
+# 关键细节：RawSize 必须 = 数据长度 + 重定位表长度，
+# 让重定位表物理上位于所属节的原始数据范围内（rsrc.exe 的
+# RelocPtr(373020) < RawPtr(60)+RawSize(372960) 正好印证）。
+RSRC_SECTION_NAME = b".rsrc"
 
 # 资源类型
 RT_ICON = 3
@@ -243,39 +270,35 @@ def build_version_info(info):
 # ---------------------------------------------------------------- 资源树构造
 
 def build_rsrc_section(entries_by_type):
-    """构造整个 .rsrc 节数据。
+    """构造 .rsrc 节数据（目录树 + 资源数据放在同一个节的连续内存里）。
 
     entries_by_type: {type_id: [(name_id, lang_id, data_bytes), ...]}
 
     资源目录结构（三层）:
         Type -> Name -> Language -> DataEntry(指向数据)
-    所有目录/数据项按 (ID, 语言) 排序，Windows 要求有序，否则 FindResource 可能失败。
-    """
-    # 先规划：一个根目录 + 每个 type 一个二级目录 + 每个 name 一个三级目录
-    # 目录项 = 8 字节(ID 4 + Offset 4)；数据项 = 16 字节
-    # 偏移高位为 1 表示指向子目录
 
-    # 计算各层需要的空间
+    数据项里的 RVA 值先写成「节内偏移」，再由链接器加上节 VA
+    （见 build_coff 生成的重定位表）。
+
+    返回 (section_bytes, rva_fixups)
+    """
     types = sorted(entries_by_type.keys())
     num_root = len(types)
-
-    # 我们先为每个 type 建立名字列表
     names_per_type = {t: sorted([e[0] for e in entries_by_type[t]]) for t in types}
 
-    # 布局规划
+    # ---- 布局规划
     pos_root_dir = 0
     pos_root_entries = pos_root_dir + 16
     cur = pos_root_entries + num_root * 8
 
-    level2_dirs = {}    # type -> offset
-    level2_entries = {}  # type -> offset
+    level2_dirs = {}
+    level2_entries = {}
     for t in types:
         level2_dirs[t] = vs_align(cur)
         cur = level2_dirs[t] + 16
         level2_entries[t] = vs_align(cur)
         cur = level2_entries[t] + len(names_per_type[t]) * 8
 
-    # 三级目录：每个 (type, name)
     level3_dirs = {}
     level3_entries = {}
     for t in types:
@@ -283,9 +306,8 @@ def build_rsrc_section(entries_by_type):
             level3_dirs[(t, n)] = vs_align(cur)
             cur = level3_dirs[(t, n)] + 16
             level3_entries[(t, n)] = vs_align(cur)
-            cur = level3_entries[(t, n)] + 8  # 单个语言项
+            cur = level3_entries[(t, n)] + 8
 
-    # 数据项区
     data_entry_pos = {}
     for t in types:
         for n in names_per_type[t]:
@@ -294,35 +316,34 @@ def build_rsrc_section(entries_by_type):
 
     pos_data = vs_align(cur)
 
-    # 现在开始实际写入
-    buf = bytearray()
-
-    def put(offset, data):
-        if len(buf) < offset + len(data):
-            buf.extend(b"\x00" * (offset + len(data) - len(buf)))
-        buf[offset:offset + len(data)] = data
-
-    # ---- 数据区（内容 + 4 字节对齐）
-    # entries_by_type: {type_id: [(name_id, lang_id, content_bytes), ...]}
+    # ---- 资源数据（紧跟目录树之后）
     data_blob = bytearray()
-    data_offsets = {}   # (t,n) -> (文件内偏移, 长度)
+    data_offsets = {}
     for t in types:
         for (nt, nl, content) in entries_by_type[t]:
             if nt not in names_per_type[t]:
                 continue
+            # 数据项里存的是节内绝对偏移（= 目录树尾部 + 已在数据区中的位置）
             off = pos_data + len(data_blob)
             data_offsets[(t, nt)] = (off, len(content))
             data_blob.extend(content)
             pad = vs_align(len(data_blob)) - len(data_blob)
             data_blob.extend(b"\x00" * pad)
 
-    # ---- 根目录
+    # ---- 写入
+    total = pos_data + len(data_blob)
+    buf = bytearray(b"\x00" * total)
+
+    def put(offset, data):
+        buf[offset:offset + len(data)] = data
+
+    # 根目录
     put(pos_root_dir, struct.pack("<IIHHHH", 0, 0, 0, 0, 0, num_root))
     for i, t in enumerate(types):
         put(pos_root_entries + i * 8,
             struct.pack("<II", t, 0x80000000 | level2_dirs[t]))
 
-    # ---- 二级目录（每个 type）
+    # 二级目录
     for t in types:
         ns = names_per_type[t]
         put(level2_dirs[t], struct.pack("<IIHHHH", 0, 0, 0, 0, 0, len(ns)))
@@ -330,33 +351,26 @@ def build_rsrc_section(entries_by_type):
             put(level2_entries[t] + i * 8,
                 struct.pack("<II", n, 0x80000000 | level3_dirs[(t, n)]))
 
-    # ---- 三级目录（每个 name，单语言）
-    # 目录头格式: Characteristics(4) TimeDateStamp(4) MajorVersion(2)
-    #             MinorVersion(2) NumberOfNamedEntries(2) NumberOfIdEntries(2)
-    # 语言 ID (0x0804) 既非字符串也非序号 0，因此必须计入 **NumberOfIdEntries**；
-    # 若误计入 NumberOfNamedEntries，Windows 会按字符串名去取，
-    # 结果 FindResource 找不到该语言分支，属性页中的"详细信息"就全部为空。
+    # 三级目录（语言层）
+    # 目录头: Characteristics(4) TimeDateStamp(4) MajorVersion(2)
+    #         MinorVersion(2) NumberOfNamedEntries(2) NumberOfIdEntries(2)
+    # 语言 ID (0x0804) 是 ID 不是名字 → 必须计入 NumberOfIdEntries（末字段=1）。
     for t in types:
         for n in names_per_type[t]:
-            put(level3_dirs[(t, n)], struct.pack("<IIHHHH", 0, 0, 0, 0, 1, 0))
+            put(level3_dirs[(t, n)], struct.pack("<IIHHHH", 0, 0, 0, 0, 0, 1))
             put(level3_entries[(t, n)],
                 struct.pack("<II", LANG_ZH_CN, data_entry_pos[(t, n)]))
 
-    # ---- 数据项
-    # 注意：数据项的 RVA 字段必须记录位置，稍后生成重定位项，
-    # 由链接器在链接时加上 .rsrc 节的最终 VA（否则资源无法被定位）。
+    # 数据项：RVA 字段先写节内偏移，稍后由链接器补上节 VA
     rva_fixups = []
     for t in types:
         for n in names_per_type[t]:
             off, ln = data_offsets[(t, n)]
             put(data_entry_pos[(t, n)], struct.pack("<IIII", off, ln, 0, 0))
-            # 记录 RVA 字段（数据项前 4 字节）在节内的偏移
             rva_fixups.append(data_entry_pos[(t, n)])
 
-    # 合并数据区
-    if len(buf) < pos_data:
-        buf.extend(b"\x00" * (pos_data - len(buf)))
-    buf.extend(data_blob)
+    # 资源数据
+    put(pos_data, bytes(data_blob))
 
     return bytes(buf), rva_fixups
 
@@ -367,61 +381,56 @@ def build_rsrc_section(entries_by_type):
 IMAGE_REL_I386_DIR32NB = 0x0007
 
 
-def build_coff(section_data, rva_fixups, section_name=b".rsrc"):
+def build_coff(section_data, rva_fixups):
     """把 COFF 目标文件封装出来。
 
-    布局:
+    布局（严格照抄官方 rsrc.exe 的输出）:
         [COFF Header 20B]
-        [Section Header 40B]
-        [节原始数据 (section_data)]
+        [Section Header .rsrc (40B)]
+        [.rsrc 节内容：资源目录树 + 资源数据]
         [重定位表 (每条 10B)]
-        [符号表: 主符号 18B + 辅助符号 18B = 36B]
-        [字符串表: 4B 长度 + ".rsrc\\0"]
+        [符号表: ".rsrc" 一项 18B]
+        [字符串表: 4B 长度（空表）]
 
-    为什么需要重定位表:
-        资源目录里「数据项」的首字段是数据的 RVA。我们在生成 .syso 时
-        并不知道 .rsrc 节最终会被链接到哪个虚拟地址，因此这里先写入
-        节内偏移，并附上 IMAGE_REL_I386_DIR32NB 重定位项，
-        由 Go 链接器在链接时自动加上节 VA。
+    关键点（全部由对比 rsrc.exe 输出反推得到）:
+      1. 只有一个节，名字就是 ".rsrc"。
+      2. 节头的 SizeOfRawData = 目录树+数据长度 + 重定位表长度，
+         使重定位表物理上落在本节的原始数据范围内。
+      3. VirtualSize = 0（rsrc.exe 就是这么写的）。
+      4. 符号表只有 1 项，名称 ".rsrc"，Value=0，SectionNumber=1。
+      5. 每条重定位都指向符号 0（本节的节符号），类型 DIR32NB。
+         Go 链接器解析为「节 VA + 数据项里已存的节内偏移」，
+         从而得到正确的资源 RVA。
+      6. 字符串表必须存在（长度=4 的空表），否则链接器报
+         "fail to read string table length: EOF"。
     """
     HEADER_SIZE = 20
     SECHDR_SIZE = 40
     REL_ENTRY_SIZE = 10          # VirtualAddress(4) SymbolTableIndex(4) Type(2)
     SYM_ENTRY_SIZE = 18
 
-    section_file_off = HEADER_SIZE + SECHDR_SIZE
-    reloc_off = section_file_off + len(section_data)
+    section_off = HEADER_SIZE + SECHDR_SIZE
+    reloc_off = section_off + len(section_data)
     num_relocs = len(rva_fixups)
     symtab_off = reloc_off + num_relocs * REL_ENTRY_SIZE
-    num_symbols = 2              # 主符号 + 1 个辅助符号
-    strtab_off = symtab_off + num_symbols * SYM_ENTRY_SIZE
+    num_symbols = 1
 
-    # 字符串表：前 4 字节存总长度，随后是名称（含结束符）
-    strtab_name = b".rsrc"
-    strtab = struct.pack("<I", 4 + len(strtab_name) + 1) + strtab_name + b"\x00"
+    # 字符串表：即使没有名字要放，也必须存在一个长度=4 的空表。
+    strtab = struct.pack("<I", 4)
 
-    # 主符号（18 字节）：名称(8) + Value(4) + SectionNumber(2) + Type(2)
-    #                       + StorageClass(1) + NumberOfAuxSymbols(1)
-    # 名称走字符串表：前 4 字节为 0，后 4 字节为字符串表内偏移
-    sym_name = struct.pack("<II", 0, 4)
-    sym_type = 0
+    # 符号[0]：名称(8) + Value(4) + SectionNumber(2) + Type(2)
+    #          + StorageClass(1) + NumAux(1)
     sym_class = 3               # IMAGE_SYM_CLASS_STATIC
-    sym_aux = 1                 # 带 1 个辅助符号
-    symbol = sym_name + struct.pack(
-        "<IhHBB", 0, 1, sym_type, sym_class, sym_aux)
-    # 辅助符号（18 字节）：Length(4) Relocs(2) Linenums(2) ... 补零到 18
-    aux = struct.pack("<IHH", len(section_data), num_relocs, 0) + b"\x00" * 10
-    symbol += aux
+    sym_name = RSRC_SECTION_NAME + b"\x00" * (8 - len(RSRC_SECTION_NAME))
+    symbols = sym_name + struct.pack("<IhHBB", 0, 1, 0, sym_class, 0)
 
-    # 重定位表：每条指向符号表第 0 项（.rsrc 节符号）
+    # 重定位表：每条指向符号 0（本节节符号）
     relocs = b""
     for off in rva_fixups:
         relocs += struct.pack("<IIH", off, 0, IMAGE_REL_I386_DIR32NB)
 
     coff = io.BytesIO()
     # ---- COFF Header (20 字节)
-    # Machine(2) NumberOfSections(2) TimeDateStamp(4) PointerToSymbolTable(4)
-    # NumberOfSymbols(4) SizeOfOptionalHeader(2) Characteristics(2)
     coff.write(struct.pack(
         "<HHIIIHH",
         IMAGE_FILE_MACHINE_I386,          # Machine
@@ -430,27 +439,29 @@ def build_coff(section_data, rva_fixups, section_name=b".rsrc"):
         symtab_off,                       # PointerToSymbolTable
         num_symbols,                      # NumberOfSymbols
         0,                                # SizeOfOptionalHeader（必须为 0）
-        0,                                # Characteristics
+        INFO_Characteristics,             # Characteristics = 0x104
     ))
-    # ---- Section Header (40 字节)
-    name = section_name + b"\x00" * (8 - len(section_name))
-    characteristics = (IMAGE_SCN_CNT_INITIALIZED_DATA
-                       | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
+
+    # ---- Section Header: .rsrc
+    # SizeOfRawData 要把重定位表也算进去（= 数据 + 重定位表），
+    # 与 rsrc.exe 的实际输出一致。
+    raw_size = len(section_data) + num_relocs * REL_ENTRY_SIZE
+    name = RSRC_SECTION_NAME + b"\x00" * (8 - len(RSRC_SECTION_NAME))
     coff.write(struct.pack(
         "<8sIIIIIIHHI",
         name,
-        len(section_data),      # VirtualSize
-        0,                      # VirtualAddress
-        len(section_data),      # SizeOfRawData
-        section_file_off,       # PointerToRawData（节数据紧跟头部）
+        0,                      # VirtualSize = 0（照抄 rsrc.exe）
+        0,                      # VirtualAddress（由链接器填）
+        raw_size,               # SizeOfRawData（含重定位表）
+        section_off,            # PointerToRawData
         reloc_off,              # PointerToRelocations
         0,                      # PointerToLinenumbers
         num_relocs,             # NumberOfRelocations
         0,                      # NumberOfLinenumbers
-        characteristics,
+        IMAGE_SCN_RSRC,
     ))
 
-    body = (coff.getvalue() + section_data + relocs + symbol + strtab)
+    body = (coff.getvalue() + section_data + relocs + symbols + strtab)
     return body
 
 
@@ -510,15 +521,15 @@ def main():
     entries_by_type[RT_VERSION].append((1, LANG_ZH_CN, ver_data))
 
     # ---- 生成 .rsrc 节 + COFF
-    section, rva_fixups = build_rsrc_section(entries_by_type)
-    blob = build_coff(section, rva_fixups)
+    section_data, rva_fixups = build_rsrc_section(entries_by_type)
+    blob = build_coff(section_data, rva_fixups)
 
     with open(out_path, "wb") as f:
         f.write(blob)
 
     print("已生成: %s (%d 字节)" % (out_path, len(blob)))
-    print("  节大小 %d 字节，重定位 %d 条，图标 %d 个，版本信息 %d 字节"
-          % (len(section), len(rva_fixups), len(icons), len(ver_data)))
+    print("  .rsrc 节 %d 字节，重定位 %d 条，图标 %d 个，版本信息 %d 字节"
+          % (len(section_data), len(rva_fixups), len(icons), len(ver_data)))
     return 0
 
 

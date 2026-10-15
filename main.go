@@ -160,6 +160,72 @@ func baseGSArgs() []string {
 	}
 }
 
+// geomGroupKey 把几何探测结果映射为「压缩策略分组键」。
+//
+// 同一分组的文件可以放进同一个 gs 进程；不同分组必须分开，
+// 因为几何基准修正参数是进程级的（见 compressChunk 注释）。
+//
+//	"std"        —— 标准纸张或无法判定：沿用原有参数，"行为与旧版完全一致"
+//	"fix:A4" 等  —— 像素当 pt 扫描件：启用 FIXEDMEDIA/FitPage/-r 修正
+func geomGroupKey(g pdfGeom) string {
+	if !g.shouldFixGeometry() {
+		return "std"
+	}
+	if g.paper.name == "" {
+		return "fix:A4"
+	}
+	return "fix:" + g.paper.name
+}
+
+// 用于「几何基准修正」时通过 -r 重设 gs 的 DPI 基准。
+func levelDPI(level CompressLevel) int {
+	switch level {
+	case LevelScreen:
+		return 72
+	case LevelEBook:
+		return 150
+	case LevelPrinter:
+		return 300
+	case LevelPrepress:
+		return 300 // prepress 与 printer 同基准，差异仅在 MonoImageResolution
+	default:
+		return 150
+	}
+}
+
+// geometryArgs 针对「像素当 pt」的扫描件，返回几何基准修正所需的额外参数。
+//
+// 背景见 pdfgeom.go 顶部注释：这类 PDF 的页面尺寸等于图片像素数，
+// gs 会把图像有效 DPI 算成 72，从而判定「无需降采样」，
+// 导致所有档位输出几乎相同、压缩率接近 0。
+//
+// 修正方式：
+//   - -dFIXEDMEDIA -dPDFFitPage：把页面重设为合理物理尺寸，
+//     让 gs 以真实物理尺寸重新计算图像 DPI；
+//   - -dDEVICEWIDTHPOINTS/-dDEVICEHEIGHTPOINTS：目标页面尺寸，
+//     按原始长宽比换算（见 targetPageSize），避免比例拉伸；
+//   - -r<档位DPI>：把基准 DPI 设为档位值，与 -dColorImageResolution 配合；
+//   - -dPassThroughJPEGImages=false：强制重编码。
+//     像素当 pt 的扫描件其原始 JPEG 往往已是「重编码过一次」的高质量样本，
+//     若仍允许透传，gs 会原样搬运、不做任何压缩。
+//
+// 若该文件不需要修正（标准纸张/无图像/无法判定），返回 nil，调用方行为完全不变。
+func geometryArgs(g pdfGeom, level CompressLevel) []string {
+	if !g.shouldFixGeometry() {
+		return nil
+	}
+	dpi := levelDPI(level)
+	pw, ph := targetPageSize(g)
+	return []string{
+		"-dFIXEDMEDIA",
+		"-dPDFFitPage",
+		fmt.Sprintf("-dDEVICEWIDTHPOINTS=%.2f", pw),
+		fmt.Sprintf("-dDEVICEHEIGHTPOINTS=%.2f", ph),
+		fmt.Sprintf("-r%d", dpi),
+		"-dPassThroughJPEGImages=false",
+	}
+}
+
 func formatSize(bytes int64) string {
 	const unit = 1024.0
 	if bytes < unit {
@@ -336,10 +402,14 @@ func compressFile(gsExe, input, output string, level CompressLevel, gsThreads in
 		return fmt.Errorf("创建输出目录失败: %v", err)
 	}
 
+	// 几何探测：仅对「像素当 pt」的扫描件启用基准修正，其余返回 nil、行为不变
+	geom := probePDFGeom(input)
+
 	args := baseGSArgs()
 	if gsThreads > 1 {
 		args = append(args, fmt.Sprintf("-dNumRenderingThreads=%d", gsThreads))
 	}
+	args = append(args, geometryArgs(geom, level)...)
 	args = append(args, gsSettings(level)...)
 	args = append(args, fmt.Sprintf("-sOutputFile=%s", sOutputFileValue(output)), input)
 
@@ -359,8 +429,12 @@ func compressFile(gsExe, input, output string, level CompressLevel, gsThreads in
 // 原理：gs 进程启动约 300ms（加载 gsdll 等），而单文件净处理仅数百毫秒，
 // 把多个文件交给同一进程处理可省掉绝大部分启动开销。
 // 通过 PostScript 的 setpagedevice 切换 /OutputFile，实现每个文件独立输出。
+//
+// ⚠ 调用方保证：同一 chunk 内所有文件的 geomKey 必须相同。
+// 因为几何基准修正（-dFIXEDMEDIA/-r 等）是页面设备级参数，
+// 一个进程内无法按文件切换。不同几何类别的文件必须分到不同 chunk。
 func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
-	gsThreads int, permitRead, permitWrite []string) error {
+	gsThreads int, permitRead, permitWrite []string, geom pdfGeom) error {
 
 	if len(inputs) == 0 {
 		return nil
@@ -379,6 +453,8 @@ func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
 	if gsThreads > 1 {
 		args = append(args, fmt.Sprintf("-dNumRenderingThreads=%d", gsThreads))
 	}
+	// 几何基准修正（仅「像素当 pt」扫描件组；标准纸张组为 nil，行为不变）
+	args = append(args, geometryArgs(geom, level)...)
 	// SAFER 沙箱授权（gs>=9.50 默认开启 SAFER，切换输出与 run 输入都需显式放行）
 	for _, d := range permitRead {
 		args = append(args, "--permit-file-read="+d)
@@ -539,6 +615,16 @@ type fileTask struct {
 	rel       string
 	orig      int64
 	overwrite bool
+
+	// geomKey 是几何分组的键：同一键的文件才会被放进同一个 gs 进程。
+	//
+	// 原因：几何基准修正（-dFIXEDMEDIA/-r/-dPassThroughJPEGImages）是
+	// 页面设备级参数，一个 gs 进程内无法为不同文件切换；
+	// 若把「标准 A4 公文」与「像素当 pt 扫描件」混在同一进程，
+	// 后者的修正会污染前者（把 A4 公文也强制套上 FIXEDMEDIA）。
+	geomKey string
+	// geom 该文件的几何探测结果（仅当需要修正时用于生成参数）
+	geom pdfGeom
 }
 
 // 一个文件的处理结果
@@ -681,6 +767,11 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 			t.writePath = out
 			t.finalPath = out
 		}
+		// 几何探测：决定该文件属于哪个压缩策略分组。
+		// 标准纸张/无法判定 → "std"（沿用原参数，行为不变）
+		// 像素当 pt 扫描件    → "fix:<纸张>"（启用几何基准修正）
+		t.geom = probePDFGeom(p)
+		t.geomKey = geomGroupKey(t.geom)
 		tasks = append(tasks, t)
 	}
 
@@ -698,24 +789,50 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		fmt.Println(strings.Repeat("-", 100))
 	}
 
-	// 构建分块：按体积从大到小排序后轮转分配。
+	// 构建分块：按「几何分组」先归类，再在组内按体积轮转分配。
+	//
+	// 为什么要先按 geomKey 分组：
+	// 几何基准修正参数是 gs 进程级的，一个进程内所有文件共享同一套页面设备参数。
+	// 若把「标准 A4 公文」与「像素当 pt 扫描件」放进同一进程，
+	// 扫描件所需的 -dFIXEDMEDIA/-r 会同时作用到公文上，破坏其原始版式。
+	// 因此分组是正确性要求，不是优化。
+	//
+	// 组内分配沿用原策略：按体积从大到小排序后轮转分配。
 	// 注意不要用“按字节负载最小”的贪心分配——小文件体积小，会全部涌入同一个
 	// 负载最小的块，形成极长的尾块。轮转分配可同时均衡文件数与总体积。
 	var chunks [][]*fileTask
 	if usePersist {
-		numChunks := (len(tasks) + chunkSize - 1) / chunkSize
-		if numChunks < 1 {
-			numChunks = 1
+		// 1) 按 geomKey 归组（保持文件顺序稳定，便于复现）
+		var groupOrder []string
+		groupMap := make(map[string][]*fileTask)
+		for _, t := range tasks {
+			if _, ok := groupMap[t.geomKey]; !ok {
+				groupOrder = append(groupOrder, t.geomKey)
+			}
+			groupMap[t.geomKey] = append(groupMap[t.geomKey], t)
 		}
-		chunks = make([][]*fileTask, numChunks)
-		order := make([]int, len(tasks))
-		for i := range order {
-			order[i] = i
-		}
-		sort.SliceStable(order, func(a, b int) bool { return tasks[order[a]].orig > tasks[order[b]].orig })
-		for k, idx := range order {
-			c := k % numChunks
-			chunks[c] = append(chunks[c], tasks[idx])
+		// 2) 每组内部分块
+		for _, key := range groupOrder {
+			grp := groupMap[key]
+			numChunks := (len(grp) + chunkSize - 1) / chunkSize
+			if numChunks < 1 {
+				numChunks = 1
+			}
+			part := make([][]*fileTask, numChunks)
+			order := make([]int, len(grp))
+			for i := range order {
+				order[i] = i
+			}
+			sort.SliceStable(order, func(a, b int) bool { return grp[order[a]].orig > grp[order[b]].orig })
+			for k, idx := range order {
+				c := k % numChunks
+				part[c] = append(part[c], grp[idx])
+			}
+			for _, c := range part {
+				if len(c) > 0 {
+					chunks = append(chunks, c)
+				}
+			}
 		}
 	} else {
 		chunks = make([][]*fileTask, len(tasks))
@@ -794,7 +911,10 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 					inputs[i] = t.input
 					outputs[i] = t.writePath
 				}
-				chunkErr := compressChunk(gsExe, inputs, outputs, level, gsThreads, permitRead, permitWrite)
+				// 同 chunk 内 geomKey 必然相同（分块时已按 geomKey 归类），
+				// 取第一个任务的几何信息代表整块即可。
+				chunkErr := compressChunk(gsExe, inputs, outputs, level, gsThreads,
+					permitRead, permitWrite, chunk[0].geom)
 
 				// 整块成功要求“每个文件都产出了有效文件”。只要有任何一个缺失就整块重做，
 				// 否则可能把异常产物（例如内容被合并进第一个文件）当作成功结果接受。
