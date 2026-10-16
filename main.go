@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -19,7 +20,7 @@ import (
 )
 
 var (
-	version = "2.4.0"
+	version = "2.4.1"
 	author  = "https://github.com/playgitboy"
 )
 
@@ -55,6 +56,14 @@ const (
 // errGSStalled 表示 gs 因长时间无输出被判为卡死（区别于普通的 gs 报错）。
 var errGSStalled = errors.New("处理停滞")
 
+// hbAfter 心跳提示阈值：结果行静默这么久后开始原位刷新「仍在处理」提示。
+// hbInterval 心跳刷新间隔（提示里的已耗时按秒跳动）。
+// 两者均用变量便于测试中调小。
+var (
+	hbAfter    = 60 * time.Second
+	hbInterval = time.Second
+)
+
 // tableSepWidth 结果表格分隔线的宽度。
 //
 // Windows 7 的命令提示符窗口默认 80 列，且属性里最大宽度也受限（不像新系统
@@ -70,6 +79,12 @@ const tableSepWidth = 77
 // 默认实现恒为 false（即不等待）；Windows 平台文件会在 init() 中
 // 注入真实检测（GetConsoleProcessList），这样即使单独编译 main.go 也不会出错。
 var launchedByDoubleClick = func() bool { return false }
+
+// isattyStdout 判断标准输出是否为交互式控制台。
+// 用于决定是否启用「心跳」这类行内刷新（\r）显示：重定向到文件/管道时
+// 必须禁用，否则每秒的控制字符会污染日志。非 Windows 平台默认 false，
+// Windows 平台在 init() 中注入真实检测（与 launchedByDoubleClick 同模式）。
+var isattyStdout = func() bool { return false }
 
 // 压缩级别。内置档位用 iota（0-3）；自定义 DPI 用 1000+dpi 编码。
 type CompressLevel int
@@ -382,6 +397,37 @@ func fileSize(path string) int64 {
 func validOutput(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Size() > 0
+}
+
+// removeQuiet 删除文件，忽略错误（文件本就不存在时立即返回）。
+//
+// 专门用于清理 gs 的中间/失败产物。Windows 上刚被终止的 gs 进程可能仍短暂
+// 持有文件句柄，或在读的杀毒软件正在扫描该文件，此时删除会因共享冲突失败；
+// 若不重试，输出目录里就会残留一个 0 字节 PDF —— 这正是用户反馈的
+// 「个别文件处理后变成 0 字节」现象（gs 已打开输出文件但还没来得及写入内容
+// 就被终止/失败，随后删除又失败，空文件留在了盘上）。
+func removeQuiet(path string) {
+	for i := 0; i < 4; i++ {
+		err := os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+}
+
+// cleanStaleOutputs 清除一组输出里「不存在或 0 字节」的无效产物。
+//
+// 用于「多文件单进程批量」失败后、准备降级为逐文件重做的阶段：
+// gs 在批量模式下一开始就把后续文件的 /OutputFile 都创建出来（打开即截断），
+// 若进程中途失败或被终止，那些已创建但未写入的文件会残留为 0 字节。
+// 此处立即清掉，避免它们被保留在输出目录里；有效产物不动（可供上层判定）。
+func cleanStaleOutputs(outputs []string) {
+	for _, o := range outputs {
+		if !validOutput(o) {
+			removeQuiet(o)
+		}
+	}
 }
 
 // samePath 判断两个路径是否指向同一个文件/目录。
@@ -763,19 +809,23 @@ func compressFile(gsExe, input, output string, level CompressLevel, gsThreads in
 	// 停滞超时：进程是被我们主动终止的，产物必然残缺，
 	// 直接判失败并清掉半成品（覆盖模式下原文件不会被动到）。
 	if errors.Is(runErr, errGSStalled) {
-		os.Remove(output)
+		removeQuiet(output)
 		return runErr
 	}
 	if runErr != nil {
+		// gs 非零退出同样可能留下残缺产物（含 0 字节空文件），必须一并清掉，
+		// 否则输出目录里会残留「看起来处理过、实际是空 PDF」的文件。
+		removeQuiet(output)
 		return gsErr(runErr, out)
 	}
 	// 源文件没能被读入时 gs 仍返回 0，却写出一个空白迷你 PDF；
 	// 这里必须显式判失败，否则会把它当成「压缩成功」。
 	if msg := gsFatalReadProblem(out); msg != nil {
-		os.Remove(output)
+		removeQuiet(output)
 		return msg
 	}
 	if !validOutput(output) {
+		removeQuiet(output)
 		return fmt.Errorf("压缩失败，未生成输出文件")
 	}
 	return nil
@@ -833,16 +883,20 @@ func compressChunk(gsExe string, inputs, outputs []string, level CompressLevel,
 	out, runErr := runGS(gsExe, args)
 	// 停滞超时：整块进程被终止，返回错误让上层降级为逐文件处理，
 	// 由 compressFile 逐个定位并单独为卡死的那个文件计时。
+	// 被终止时已创建但未写入的输出文件会残留为 0 字节，先清掉。
 	if errors.Is(runErr, errGSStalled) {
+		cleanStaleOutputs(outputs)
 		return runErr
 	}
 	if runErr != nil {
+		cleanStaleOutputs(outputs)
 		return gsErr(runErr, out)
 	}
 	// 块内只要有任何文件是「加密/无法解析」，就在共享输出里留下致命签名。
 	// 此时整块结果不可信：返回错误让上层降级为逐文件处理，由 compressFile
 	// 逐个精确定位并为坏文件保留原文。正常文件不会命中这些签名。
 	if msg := gsFatalReadProblem(out); msg != nil {
+		cleanStaleOutputs(outputs)
 		return msg
 	}
 	return nil
@@ -899,6 +953,48 @@ func findPDFs(root string, recursive bool, skip map[string]bool) ([]string, []st
 	return pdfs, unreadable, nil
 }
 
+// scanFolderPDFs 递归扫描拖入的文件夹，返回其中全部 PDF 的绝对路径。
+//
+// 返回的路径为绝对路径，便于 runFiles 去重（同一文件可能既被单独拖入、
+// 又被包含在某个拖入的文件夹里）。
+//
+// 跳过历史遗留的 compressed/ 子目录：旧版目录模式默认把结果集中输出到该
+// 目录，若不清除会把上一轮生成的结果当成源文件再压一遍。
+func scanFolderPDFs(dir string) ([]string, []string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	skip := map[string]bool{
+		filepath.Clean(filepath.Join(abs, "compressed")): true,
+	}
+	return findPDFs(abs, true, skip)
+}
+
+// filterSelfOutputs 从「文件夹扫描结果」中剔除本级别上一次的输出文件，
+// 即文件名形如「原名_<级别>.pdf」的文件。
+//
+// 这些文件是本工具就地输出的产物：再次压缩它们没有意义（只会得到
+// 原名_ebook_ebook.pdf），并且它们的名字正好会与原始文件的输出同名，
+// 触发「输出名与源文件冲突」的保护而使整批任务中止——用户重复拖放同一
+// 个文件夹时必然踩到。
+//
+// 只作用于文件夹扫描。用户单独拖入的 PDF 一律照常处理（明确意图优先）。
+func filterSelfOutputs(pdfs []string, level CompressLevel) (kept []string, skipped int) {
+	suffix := "_" + levelSlug(level)
+	kept = make([]string, 0, len(pdfs))
+	for _, p := range pdfs {
+		base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		// 要求主体比后缀长，避免把名字本身就叫「_ebook.pdf」的文件误判
+		if len(base) > len(suffix) && strings.EqualFold(base[len(base)-len(suffix):], suffix) {
+			skipped++
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept, skipped
+}
+
 // exitAfterPause 退出程序。若为双击/拖放启动，先等待用户回车，
 // 避免出错时控制台窗口一闪而过、用户根本来不及看清错误信息。
 func exitAfterPause(code int) {
@@ -917,6 +1013,49 @@ func pause() {
 	fmt.Println()
 	fmt.Println("按回车键继续...")
 	fmt.Scanln()
+}
+
+// startHeartbeat 单文件模式的心跳提示：压缩静默超过 60 秒时在行首原位
+// 刷新（\r）一条提示，防止大文件（上千页 PDF 需数分钟）被误认为卡死。
+// 返回的 stop 会清除心跳行并等待后台协程退出（保证打印结果行时不被干扰）。
+// 仅在交互式控制台生效；重定向到文件/管道时返回空操作（避免污染日志）。
+func startHeartbeat(name string, quiet bool) (stop func()) {
+	if quiet || !isattyStdout() {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		tick := time.NewTicker(hbInterval)
+		defer tick.Stop()
+		begin := time.Now()
+		hbLen := 0
+		clear := func() {
+			if hbLen > 0 {
+				fmt.Printf("\r%s\r", strings.Repeat(" ", hbLen))
+				hbLen = 0
+			}
+		}
+		for {
+			select {
+			case <-done:
+				clear()
+				return
+			case <-tick.C:
+				silent := time.Since(begin)
+				if silent < hbAfter {
+					continue
+				}
+				msg := fmt.Sprintf("仍在处理: %s，已 %s", truncName(name, 40), silent.Round(time.Second))
+				clear()
+				fmt.Print("\r" + msg)
+				// 按字节长度清除：中日韩字符 3 字节 > 2 列宽，必然覆盖干净
+				hbLen = len(msg)
+			}
+		}
+	}()
+	return func() { close(done); <-stopped }
 }
 
 // 压缩单个PDF并输出结果，返回是否成功
@@ -938,10 +1077,15 @@ func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quie
 		writePath = tempOutputPath(filepath.Dir(input), 0)
 	}
 
-	if err := compressFile(gsExe, input, writePath, level, gsThreads); err != nil {
+	// 心跳提示：单文件压缩可能持续数分钟（千页级 PDF），静默超 60 秒时
+	// 在行首原位刷新，避免被误认为卡死。
+	hbStop := startHeartbeat(filepath.Base(input), quiet)
+	err := compressFile(gsExe, input, writePath, level, gsThreads)
+	hbStop()
+	if err != nil {
 		// 失败时清掉本次可能写出的半成品（含 gs 产出的空白迷你 PDF），
 		// 避免在输出目录留下误导性的文件。
-		os.Remove(writePath)
+		removeQuiet(writePath)
 		fmt.Fprintf(os.Stderr, "压缩失败: %v\n", err)
 		return false
 	}
@@ -950,12 +1094,12 @@ func runSingle(gsExe, input, output string, level CompressLevel, overwrite, quie
 	kept := false
 	if compSize <= 0 || compSize >= origSize {
 		// 压缩后没有变小，保留原文件更划算
-		os.Remove(writePath)
+		removeQuiet(writePath)
 		compSize = origSize
 		kept = true
 	} else if overwrite {
 		if err := replaceOriginal(writePath, input); err != nil {
-			os.Remove(writePath)
+			removeQuiet(writePath)
 			fmt.Fprintf(os.Stderr, "压缩失败: 替换原文件失败（文件可能被占用）: %v\n", err)
 			return false
 		}
@@ -1008,6 +1152,15 @@ type fileTask struct {
 	geomKey string
 	// geom 该文件的几何探测结果（仅当需要修正时用于生成参数）
 	geom pdfGeom
+
+	// hasDests 表示文件含书签/命名目标等「跨文档泄漏」结构，必须独占 gs 进程。
+	//
+	// 原因（2026-10-16 Win7/Win11 实测）：gs 的 pdfwrite 设备会把上一个文档的
+	// pdfmark 目标（书签页码等）累积在设备状态里；同一进程接着 `run` 下一个
+	// PDF 时，这些目标会按**新文档**的页数去解析（如「页 1483」对 9 页文档），
+	// 导致 gs 长时间空转（9 页文件单独 2 秒、跟在 1483 页带书签文件后 5 分钟
+	// 仍完不成），表现为主程序「处理到一半卡死」。带书签文件一律单文件单进程。
+	hasDests bool
 }
 
 // 一个文件的处理结果
@@ -1115,6 +1268,99 @@ func probeAll(paths []string, workers int) []pdfGeom {
 	return geoms
 }
 
+// destMarkerBytes 判定「文件会被 pdfmark 跨文档状态污染」的特征串：
+//   - /Outlines：文档级书签树（最常见，如大部头图书/税则类 PDF）
+//   - /Dests   ：命名目标表（目录跳转常用）
+//   - /GoTo    ：跳转动作（链接注释的目标）
+//
+// 命中任意一个就必须独占 gs 进程（详见 fileTask.hasDests 注释）。
+// 误判（内容流里恰好出现这些字样）只会让该文件单独开进程，损失一点
+// 启动开销，不影响正确性；漏判才有风险，因此特征宁多勿少。
+var destMarkerBytes = [][]byte{[]byte("/Outlines"), []byte("/Dests"), []byte("/GoTo")}
+
+// pdfHasDestMarkers 流式扫描文件是否含书签/命名目标特征。
+//
+// 按 1MiB 窗口读取（峰值内存恒定），相邻窗口间保留 16 字节重叠，
+// 保证特征串跨窗口边界时也能命中。文件无法打开时按「有特征」处理：
+// 宁可让该文件独占进程，也不冒卡死风险。
+func pdfHasDestMarkers(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+
+	const win = 1 << 20
+	buf := make([]byte, win)
+	var carry []byte
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			data := buf[:n]
+			if len(carry) > 0 {
+				joined := make([]byte, 0, len(carry)+n)
+				joined = append(joined, carry...)
+				joined = append(joined, data...)
+				if hasAnyDestMarker(joined) {
+					return true
+				}
+			} else if hasAnyDestMarker(data) {
+				return true
+			}
+			tail := n - 16
+			if tail < 0 {
+				tail = 0
+			}
+			carry = append(carry[:0], data[tail:]...)
+		}
+		if rerr != nil {
+			return false
+		}
+	}
+}
+
+func hasAnyDestMarker(b []byte) bool {
+	for _, m := range destMarkerBytes {
+		if bytes.Contains(b, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// scanDestMarkers 并行探测一组文件的书签/命名目标特征，返回与 paths 等长结果。
+// 并行度与 probeAll 相同（最多 4 路），避免大目录前置等待过久。
+func scanDestMarkers(paths []string, workers int) []bool {
+	res := make([]bool, len(paths))
+	pw := workers
+	if pw > 4 {
+		pw = 4
+	}
+	if pw > len(paths) {
+		pw = len(paths)
+	}
+	if pw < 1 {
+		pw = 1
+	}
+	var idx int32
+	var wg sync.WaitGroup
+	for i := 0; i < pw; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j := int(atomic.AddInt32(&idx, 1)) - 1
+				if j >= len(paths) {
+					return
+				}
+				res[j] = pdfHasDestMarkers(paths[j])
+			}
+		}()
+	}
+	wg.Wait()
+	return res
+}
+
 // warnGeomDegraded 对「读取不完整」的任务给出一致的 stderr 提示：
 // 其几何判定可能失真（本该启用修正的扫描件会按常规参数处理，
 // 压缩率低于预期且无其它迹象）。如实提示，而不是静默降质。
@@ -1206,9 +1452,24 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 			}
 			groupMap[t.geomKey] = append(groupMap[t.geomKey], t)
 		}
-		// 2) 每组内部分块
+		// 2) 每组内部分块。带书签/命名目标的文件必须先拆出来独占进程：
+		//    gs 的 pdfmark 目标状态会从上一个文档泄漏到下一个文档（详见
+		//    fileTask.hasDests），这类文件绝不能与其它文件串联在同一个进程里。
 		for _, key := range groupOrder {
-			grp := groupMap[key]
+			var grp []*fileTask
+			{
+				all := groupMap[key]
+				for _, t := range all {
+					if t.hasDests {
+						chunks = append(chunks, []*fileTask{t})
+					} else {
+						grp = append(grp, t)
+					}
+				}
+			}
+			if len(grp) == 0 {
+				continue
+			}
 			numChunks := (len(grp) + chunkSize - 1) / chunkSize
 			if numChunks < 1 {
 				numChunks = 1
@@ -1255,12 +1516,6 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 	var wg sync.WaitGroup
 	var persistBroken int32 // 一旦发现本机单进程模式不可用，后续块直接走逐文件
 
-	// 进度提示：单进程批量模式下，一个块内的多个文件要等整个块跑完才会打印结果，
-	// 大文件场景下会「长时间没有任何输出」，用户容易误以为卡死。
-	// 因此块一开始就打印一行“开始处理”，让用户始终能看到进展。
-	var progressMu sync.Mutex
-	var startedChunks int32
-
 	for w := 0; w < par; w++ {
 		wg.Add(1)
 		go func() {
@@ -1272,17 +1527,17 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 				// 空白 PDF，仅凭体积安全网会把它算成 KEEP 成功。这里与
 				// compressFile 的守卫保持一致，直接判失败并清掉产物。
 				if t.orig == 0 {
-					os.Remove(t.writePath)
+					removeQuiet(t.writePath)
 					return fileResult{task: t, err: fmt.Errorf("源文件为空或无法读取（0 字节，已保留原文件）")}
 				}
 				compSize := fileSize(t.writePath)
 				if compSize <= 0 || compSize >= t.orig {
-					os.Remove(t.writePath)
+					removeQuiet(t.writePath)
 					return fileResult{task: t, compSize: t.orig, kept: true}
 				}
 				if t.overwrite {
 					if err := replaceOriginal(t.writePath, t.finalPath); err != nil {
-						os.Remove(t.writePath)
+						removeQuiet(t.writePath)
 						return fileResult{task: t, err: fmt.Errorf("替换原文件失败（可能被占用）: %v", err)}
 					}
 				}
@@ -1290,7 +1545,7 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 			}
 			// 失败：清理残留（临时文件或半成品），避免留下误导性的文件
 			failed := func(t *fileTask, e error) fileResult {
-				os.Remove(t.writePath)
+				removeQuiet(t.writePath)
 				return fileResult{task: t, err: e}
 			}
 			// 逐文件处理一个块（也是单进程模式不可用时的降级路径）
@@ -1308,15 +1563,6 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 				if atomic.LoadInt32(&persistBroken) == 1 {
 					runPerFile(chunk)
 					continue
-				}
-
-				// 块内多文件时先报进度，避免「长时间无输出」被误判为卡死
-				if !opt.quiet && len(chunk) > 1 {
-					n := atomic.AddInt32(&startedChunks, 1)
-					progressMu.Lock()
-					fmt.Printf("  ... 开始第 %d/%d 批（%d 个文件，起始：%s）\n",
-						n, len(chunks), len(chunk), truncName(chunk[0].rel, 40))
-					progressMu.Unlock()
 				}
 
 				inputs := make([]string, len(chunk))
@@ -1380,40 +1626,93 @@ func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskS
 	var done int32
 	failList := make([]string, 0)
 
-	for res := range results {
-		done++
-		totalOrig += res.task.orig
-
-		displayName := truncName(res.task.rel, 60)
-
-		if res.err != nil {
-			failFiles++
-			failList = append(failList, fmt.Sprintf("%s: %v", res.task.rel, res.err))
-			if !opt.quiet {
-				fmt.Printf("%-5d %-6s %10s %10s %8s  %s\n",
-					done, "FAIL", formatSize(res.task.orig), "-", "-", displayName)
-			}
-			continue
-		}
-
-		successFiles++
-		totalComp += res.compSize
-		ratio := float64(0)
-		if res.task.orig > 0 {
-			ratio = (1 - float64(res.compSize)/float64(res.task.orig)) * 100
-		}
-		if !opt.quiet {
-			tag := "OK"
-			if res.kept {
-				tag = "KEEP"
-				keptFiles++
-			}
-			fmt.Printf("%-5d %-6s %10s %10s %7.1f%%  %s\n",
-				done, tag, formatSize(res.task.orig), formatSize(res.compSize), ratio, displayName)
-		} else if res.kept {
-			keptFiles++
+	// 心跳提示：结果行静默超过 60 秒时，在本行原位刷新（\r）一条提示，
+	// 避免大文件（如上千页带书签 PDF 独占进程需数分钟）期间看起来像卡死。
+	// 仅在交互式控制台启用：重定向时 \r 控制符会污染日志文件。
+	// 静默计时从「上一行结果」起算，任何新结果都会刷新并清除心跳行。
+	remaining := make(map[*fileTask]struct{}, len(tasks))
+	for _, t := range tasks {
+		remaining[t] = struct{}{}
+	}
+	hbEnabled := !opt.quiet && isattyStdout()
+	hbTick := time.NewTicker(hbInterval)
+	defer hbTick.Stop()
+	hbSince := time.Now()
+	hbLen := 0
+	clearHB := func() {
+		if hbLen > 0 {
+			fmt.Printf("\r%s\r", strings.Repeat(" ", hbLen))
+			hbLen = 0
 		}
 	}
+
+consumeLoop:
+	for {
+		select {
+		case res, ok := <-results:
+			if !ok {
+				break consumeLoop
+			}
+			delete(remaining, res.task)
+			clearHB()
+			hbSince = time.Now()
+			done++
+			totalOrig += res.task.orig
+
+			displayName := truncName(res.task.rel, 60)
+
+			if res.err != nil {
+				failFiles++
+				failList = append(failList, fmt.Sprintf("%s: %v", res.task.rel, res.err))
+				if !opt.quiet {
+					fmt.Printf("%-5d %-6s %10s %10s %8s  %s\n",
+						done, "FAIL", formatSize(res.task.orig), "-", "-", displayName)
+				}
+				continue
+			}
+
+			successFiles++
+			totalComp += res.compSize
+			ratio := float64(0)
+			if res.task.orig > 0 {
+				ratio = (1 - float64(res.compSize)/float64(res.task.orig)) * 100
+			}
+			if !opt.quiet {
+				tag := "OK"
+				if res.kept {
+					tag = "KEEP"
+					keptFiles++
+				}
+				fmt.Printf("%-5d %-6s %10s %10s %7.1f%%  %s\n",
+					done, tag, formatSize(res.task.orig), formatSize(res.compSize), ratio, displayName)
+			} else if res.kept {
+				keptFiles++
+			}
+
+		case <-hbTick.C:
+			if !hbEnabled || len(remaining) == 0 {
+				continue
+			}
+			silent := time.Since(hbSince)
+			if silent < hbAfter {
+				continue
+			}
+			// 展示剩余文件中最大的那个（最可能是耗时大户）
+			var lg *fileTask
+			for t := range remaining {
+				if lg == nil || t.orig > lg.orig {
+					lg = t
+				}
+			}
+			msg := fmt.Sprintf("仍在处理: %s 等 %d 个文件，已静默 %s",
+				truncName(lg.rel, 36), len(remaining), silent.Round(time.Second))
+			clearHB()
+			fmt.Print("\r" + msg)
+			// 用字节长度做清除宽度：中日韩字符 3 字节 > 2 列宽，必然覆盖干净
+			hbLen = len(msg)
+		}
+	}
+	clearHB()
 
 	elapsed := time.Since(start)
 	totalRatio := float64(0)
@@ -1523,6 +1822,8 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 
 	// 几何探测：并行完成（每个文件最多读 8MiB）
 	geoms := probeAll(pdfs, workers)
+	// 书签/命名目标探测：带特征的文件必须独占 gs 进程（防 pdfmark 跨文档污染）
+	dests := scanDestMarkers(pdfs, workers)
 
 	// 构造任务并预建输出目录（原实现每个文件都 MkdirAll 一次）
 	tasks := make([]*fileTask, 0, len(pdfs))
@@ -1532,7 +1833,7 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		if relErr != nil {
 			rel = filepath.Base(p)
 		}
-		t := &fileTask{input: p, rel: rel, orig: fileSize(p), overwrite: overwrite}
+		t := &fileTask{input: p, rel: rel, orig: fileSize(p), overwrite: overwrite, hasDests: dests[i]}
 		if overwrite {
 			t.writePath = tempOutputPath(filepath.Dir(p), i)
 			t.finalPath = p
@@ -1615,6 +1916,8 @@ func runFiles(gsExe string, files []string, level CompressLevel, workers int, qu
 	}
 
 	geoms := probeAll(files, workers)
+	// 书签/命名目标探测：带特征的文件必须独占 gs 进程（防 pdfmark 跨文档污染）
+	dests := scanDestMarkers(files, workers)
 
 	// 极端情况拦截：某个文件的输出名正好等于本次另一个源文件名
 	// （例如同时拖入 a.pdf 与 a_ebook.pdf、级别 ebook）。
@@ -1645,7 +1948,7 @@ func runFiles(gsExe string, files []string, level CompressLevel, workers int, qu
 	for i, p := range files {
 		dir := filepath.Dir(p)
 		permitDirSet[withSep(dir)] = true
-		t := &fileTask{input: p, rel: filepath.Base(p), orig: fileSize(p), overwrite: overwrite}
+		t := &fileTask{input: p, rel: filepath.Base(p), orig: fileSize(p), overwrite: overwrite, hasDests: dests[i]}
 		if overwrite {
 			t.writePath = tempOutputPath(dir, i)
 			t.finalPath = p
@@ -1763,7 +2066,8 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  拖放:    把PDF文件或文件夹拖到 pdfcompress 图标上即可（默认ebook级别）\n")
-		fmt.Fprintf(os.Stderr, "           支持多选：可一次拖多个PDF/文件夹，逐个处理；目录自动递归扫描\n")
+		fmt.Fprintf(os.Stderr, "           支持多选：可一次拖多个PDF/文件夹，合并为一批处理；目录自动递归扫描\n")
+		fmt.Fprintf(os.Stderr, "           输出位置 = 每个源文件所在目录（文件夹拖入时同样逐文件就地输出）\n")
 		fmt.Fprintf(os.Stderr, "           输出文件名 = 原名_压缩级别.pdf（如 报告_ebook.pdf）\n")
 		fmt.Fprintf(os.Stderr, "  简写:    pdfcompress 文件.pdf [screen|ebook|printer|prepress]\n")
 		fmt.Fprintf(os.Stderr, "  单文件:  pdfcompress -i input.pdf -o output.pdf [选项]\n")
@@ -1887,10 +2191,12 @@ func main() {
 		fmt.Println(strings.Repeat("=", 60))
 
 		var failTotal int32
-		// 先把「文件」与「文件夹」分开：多个文件合并为一批，走与目录拖放
-		// 完全相同的分块/并发/表格显示；文件夹逐个按目录模式处理。
+		// 拖入的「文件」与「文件夹」统一合并为一批：
+		// 文件夹先递归扫描成文件列表，再与散装文件合并，共同走 runFiles。
+		// 于是两种拖放方式的输出位置、命名规则、结果表格完全一致——
+		// 每个结果都写在对应源文件的同目录下，命名为「原名_<级别>.pdf」，
+		// 而不再把整个文件夹的结果集中堆到 compressed 子目录里。
 		var looseFiles []string
-		var folders []string
 		for _, p := range dropPaths {
 			info, statErr := os.Stat(p)
 			if statErr != nil {
@@ -1899,7 +2205,26 @@ func main() {
 				continue
 			}
 			if info.IsDir() {
-				folders = append(folders, p)
+				pdfs, unreadable, err := scanFolderPDFs(p)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\n[跳过] 文件夹无法读取: %s (%v)\n", p, err)
+					failTotal++
+					continue
+				}
+				pdfs, skipped := filterSelfOutputs(pdfs, compressLevel)
+				fmt.Printf("\n>>> 处理文件夹: %s（找到 %d 个PDF）\n", p, len(pdfs))
+				if skipped > 0 {
+					fmt.Printf("[提示] 跳过 %d 个已存在的 %s 级输出（原名_%s.pdf），避免重复压缩\n",
+						skipped, levelSlug(compressLevel), levelSlug(compressLevel))
+				}
+				if len(unreadable) > 0 {
+					// 个别子目录/文件不可读时只跳过并提示，不让整批任务失败
+					fmt.Fprintf(os.Stderr, "[提示] 该文件夹下有 %d 个目录/文件无法读取，已跳过：\n", len(unreadable))
+					for _, u := range unreadable {
+						fmt.Fprintf(os.Stderr, "  - %s\n", truncName(u, 80))
+					}
+				}
+				looseFiles = append(looseFiles, pdfs...)
 			} else if strings.EqualFold(filepath.Ext(p), ".pdf") {
 				looseFiles = append(looseFiles, p)
 			} else {
@@ -1920,17 +2245,8 @@ func main() {
 			} else {
 				failTotal += fails
 			}
-		}
-
-		for _, p := range folders {
-			fmt.Printf("\n>>> 处理文件夹: %s\n", p)
-			fails := runBatch(gsExe, p, "", true, compressLevel, *workers, *quiet, gsT,
-				*persist, usePermits, *chunk, *overwrite)
-			if fails < 0 {
-				failTotal++
-			} else {
-				failTotal += fails
-			}
+		} else {
+			fmt.Println("未找到PDF文件")
 		}
 		if failTotal > 0 {
 			exitAfterPause(1)

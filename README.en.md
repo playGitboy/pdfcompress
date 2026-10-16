@@ -50,7 +50,10 @@ works well on both **image-heavy (scanned)** and **text-heavy (electronic docume
 2. Select one or more PDF files, or a single folder.
 3. Drag them onto `pdfcompress.exe` and release — compression starts immediately.
 4. Output is written next to the source as `originalname_ebook.pdf` (the suffix is the
-   active compression level).
+   active compression level). This also applies when you drag a **folder**: every PDF is
+   written in place, right next to its own source — results are no longer piled into a
+   single `compressed` subdirectory. Existing same-level outputs inside the folder
+   (`originalname_ebook.pdf`) are skipped automatically to avoid pointless re-compression.
 
 **Linux (Kylin / UOS, ARM64 & x86_64)**
 
