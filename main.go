@@ -1080,6 +1080,380 @@ func calcGSThreads(workers int) int {
 	return capThreads(t)
 }
 
+// probeAll 并行探测一组文件的页面几何信息，返回与 paths 等长的结果。
+//
+// 并行度取较小值（最多 4）：大目录下探测是纯 IO 等待，串行会造成明显的前置延迟；
+// 但机械盘/网络盘上过多并发会拖慢顺序读，且每路峰值约 8MiB，需要控内存。
+func probeAll(paths []string, workers int) []pdfGeom {
+	geoms := make([]pdfGeom, len(paths))
+	pw := workers
+	if pw > 4 {
+		pw = 4
+	}
+	if pw > len(paths) {
+		pw = len(paths)
+	}
+	if pw < 1 {
+		pw = 1
+	}
+	var idx int32
+	var wg sync.WaitGroup
+	for i := 0; i < pw; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt32(&idx, 1)) - 1
+				if i >= len(paths) {
+					return
+				}
+				geoms[i] = probePDFGeom(paths[i])
+			}
+		}()
+	}
+	wg.Wait()
+	return geoms
+}
+
+// warnGeomDegraded 对「读取不完整」的任务给出一致的 stderr 提示：
+// 其几何判定可能失真（本该启用修正的扫描件会按常规参数处理，
+// 压缩率低于预期且无其它迹象）。如实提示，而不是静默降质。
+func warnGeomDegraded(tasks []*fileTask) {
+	var names []string
+	for _, t := range tasks {
+		if t.geom.readDegraded {
+			names = append(names, t.rel)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"[提示] %d 个文件读取不完整，几何判定可能失真（将按常规参数处理，压缩率或低于预期）：\n",
+		len(names))
+	for _, n := range names {
+		fmt.Fprintf(os.Stderr, "  - %s\n", truncName(n, 60))
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// taskSetOptions 是 processTasks 的运行参数。
+type taskSetOptions struct {
+	gsExe      string
+	level      CompressLevel
+	workers    int
+	quiet      bool
+	gsThreads  int
+	persist    bool
+	usePermits bool
+	chunk      int
+	overwrite  bool
+	// start 为整批任务的起始时间（含扫描/探测）；零值则取进入本函数的时间。
+	start time.Time
+	// outputLine 是汇总里的一行输出说明（非覆盖模式用），
+	// 目录模式为「输出目录: ...」，多文件拖放为「输出: 与源文件同目录（原名_级别.pdf）」。
+	outputLine string
+}
+
+// processTasks 对一批已构造好的文件任务执行：
+// 分块（按几何分组）→ 并发处理（必要时单进程复用）→ 结果表格 → 汇总。
+//
+// 目录批量与「多文件拖放」共用本函数，因此两者的处理方式与显示效果完全一致。
+// 调用方负责扫描/探测/构造任务，并提供 gs SAFER 所需的 permit 目录。
+func processTasks(tasks []*fileTask, permitRead, permitWrite []string, opt taskSetOptions) int32 {
+	start := opt.start
+	if start.IsZero() {
+		start = time.Now()
+	}
+	workers := opt.workers
+	if workers < 1 {
+		workers = 1
+	}
+
+	// 规划分块：决定“单进程多文件”还是“一文件一进程”
+	chunkSize := planChunkSize(len(tasks), workers, opt.chunk)
+	usePersist := opt.persist && opt.usePermits && chunkSize > 1
+
+	if !opt.quiet {
+		mode := "每文件独立进程"
+		if usePersist {
+			mode = fmt.Sprintf("单进程批量（每进程 %d 个文件）", chunkSize)
+		}
+		fmt.Printf("找到 %d 个PDF文件，开始压缩... [%s]\n\n", len(tasks), mode)
+		fmt.Printf("%-5s %-6s %10s %10s %8s  %s\n", "#", "状态", "原始", "压缩后", "压缩率", "文件")
+		fmt.Println(strings.Repeat("-", tableSepWidth))
+	}
+
+	// 构建分块：按「几何分组」先归类，再在组内按体积轮转分配。
+	//
+	// 为什么要先按 geomKey 分组：
+	// 几何基准修正参数是 gs 进程级的，一个进程内所有文件共享同一套页面设备参数。
+	// 若把「标准 A4 公文」与「像素当 pt 扫描件」放进同一进程，
+	// 扫描件所需的 -dFIXEDMEDIA/-r 会同时作用到公文上，破坏其原始版式。
+	// 因此分组是正确性要求，不是优化。
+	//
+	// 组内分配沿用原策略：按体积从大到小排序后轮转分配。
+	// 注意不要用“按字节负载最小”的贪心分配——小文件体积小，会全部涌入同一个
+	// 负载最小的块，形成极长的尾块。轮转分配可同时均衡文件数与总体积。
+	var chunks [][]*fileTask
+	if usePersist {
+		// 1) 按 geomKey 归组（保持文件顺序稳定，便于复现）
+		var groupOrder []string
+		groupMap := make(map[string][]*fileTask)
+		for _, t := range tasks {
+			if _, ok := groupMap[t.geomKey]; !ok {
+				groupOrder = append(groupOrder, t.geomKey)
+			}
+			groupMap[t.geomKey] = append(groupMap[t.geomKey], t)
+		}
+		// 2) 每组内部分块
+		for _, key := range groupOrder {
+			grp := groupMap[key]
+			numChunks := (len(grp) + chunkSize - 1) / chunkSize
+			if numChunks < 1 {
+				numChunks = 1
+			}
+			part := make([][]*fileTask, numChunks)
+			order := make([]int, len(grp))
+			for i := range order {
+				order[i] = i
+			}
+			sort.SliceStable(order, func(a, b int) bool { return grp[order[a]].orig > grp[order[b]].orig })
+			for k, idx := range order {
+				c := k % numChunks
+				part[c] = append(part[c], grp[idx])
+			}
+			for _, c := range part {
+				if len(c) > 0 {
+					chunks = append(chunks, c)
+				}
+			}
+		}
+	} else {
+		chunks = make([][]*fileTask, len(tasks))
+		for i, t := range tasks {
+			chunks[i] = []*fileTask{t}
+		}
+	}
+
+	// 结果通道：由主 goroutine 统一打印，统计量无需加锁
+	results := make(chan fileResult, 256)
+	chunkCh := make(chan []*fileTask, len(chunks))
+	for _, c := range chunks {
+		chunkCh <- c
+	}
+	close(chunkCh)
+
+	par := workers
+	if par > len(chunks) {
+		par = len(chunks)
+	}
+	if par < 1 {
+		par = 1
+	}
+
+	var wg sync.WaitGroup
+	var persistBroken int32 // 一旦发现本机单进程模式不可用，后续块直接走逐文件
+
+	// 进度提示：单进程批量模式下，一个块内的多个文件要等整个块跑完才会打印结果，
+	// 大文件场景下会「长时间没有任何输出」，用户容易误以为卡死。
+	// 因此块一开始就打印一行“开始处理”，让用户始终能看到进展。
+	var progressMu sync.Mutex
+	var startedChunks int32
+
+	for w := 0; w < par; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// 后处理：覆盖模式下用临时文件替换原文件；未变小时保留原文件
+			finalize := func(t *fileTask) fileResult {
+				// 空文件（0 字节，或 os.Stat 失败导致 orig=0）：gs 会成功写出一个
+				// 空白 PDF，仅凭体积安全网会把它算成 KEEP 成功。这里与
+				// compressFile 的守卫保持一致，直接判失败并清掉产物。
+				if t.orig == 0 {
+					os.Remove(t.writePath)
+					return fileResult{task: t, err: fmt.Errorf("源文件为空或无法读取（0 字节，已保留原文件）")}
+				}
+				compSize := fileSize(t.writePath)
+				if compSize <= 0 || compSize >= t.orig {
+					os.Remove(t.writePath)
+					return fileResult{task: t, compSize: t.orig, kept: true}
+				}
+				if t.overwrite {
+					if err := replaceOriginal(t.writePath, t.finalPath); err != nil {
+						os.Remove(t.writePath)
+						return fileResult{task: t, err: fmt.Errorf("替换原文件失败（可能被占用）: %v", err)}
+					}
+				}
+				return fileResult{task: t, compSize: compSize}
+			}
+			// 失败：清理残留（临时文件或半成品），避免留下误导性的文件
+			failed := func(t *fileTask, e error) fileResult {
+				os.Remove(t.writePath)
+				return fileResult{task: t, err: e}
+			}
+			// 逐文件处理一个块（也是单进程模式不可用时的降级路径）
+			runPerFile := func(chunk []*fileTask) {
+				for _, t := range chunk {
+					if e := compressFile(opt.gsExe, t.input, t.writePath, opt.level, opt.gsThreads); e != nil {
+						results <- failed(t, e)
+						continue
+					}
+					results <- finalize(t)
+				}
+			}
+
+			for chunk := range chunkCh {
+				if atomic.LoadInt32(&persistBroken) == 1 {
+					runPerFile(chunk)
+					continue
+				}
+
+				// 块内多文件时先报进度，避免「长时间无输出」被误判为卡死
+				if !opt.quiet && len(chunk) > 1 {
+					n := atomic.AddInt32(&startedChunks, 1)
+					progressMu.Lock()
+					fmt.Printf("  ... 开始第 %d/%d 批（%d 个文件，起始：%s）\n",
+						n, len(chunks), len(chunk), truncName(chunk[0].rel, 40))
+					progressMu.Unlock()
+				}
+
+				inputs := make([]string, len(chunk))
+				outputs := make([]string, len(chunk))
+				for i, t := range chunk {
+					inputs[i] = t.input
+					outputs[i] = t.writePath
+				}
+				// 同 chunk 内 geomKey 必然相同（分块时已按 geomKey 归类），
+				// 取第一个任务的几何信息代表整块即可。
+				chunkErr := compressChunk(opt.gsExe, inputs, outputs, opt.level, opt.gsThreads,
+					permitRead, permitWrite, chunk[0].geom)
+
+				// 整块成功要求“每个文件都产出了有效文件”。只要有任何一个缺失就整块重做，
+				// 否则可能把异常产物（例如内容被合并进第一个文件）当作成功结果接受。
+				chunkOK := chunkErr == nil
+				if chunkOK {
+					for _, t := range chunk {
+						if !validOutput(t.writePath) {
+							chunkOK = false
+							break
+						}
+					}
+				}
+				if chunkOK {
+					for _, t := range chunk {
+						results <- finalize(t)
+					}
+					continue
+				}
+
+				// 一个产物都没有 → 判定本机不支持单进程模式（如 gs 版本/构建差异），
+				// 后续块直接走逐文件，避免每次都白跑一遍。
+				if len(chunk) > 1 {
+					anyValid := false
+					for _, t := range chunk {
+						if validOutput(t.writePath) {
+							anyValid = true
+							break
+						}
+					}
+					if !anyValid && atomic.CompareAndSwapInt32(&persistBroken, 0, 1) && !opt.quiet {
+						fmt.Fprintln(os.Stderr, "[提示] 单进程批量模式在本机不可用，已自动切换为逐文件模式")
+					}
+				}
+				runPerFile(chunk)
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var totalFiles int32 = int32(len(tasks))
+	var successFiles int32
+	var failFiles int32
+	var keptFiles int32
+	var totalOrig int64
+	var totalComp int64
+	var done int32
+	failList := make([]string, 0)
+
+	for res := range results {
+		done++
+		totalOrig += res.task.orig
+
+		displayName := truncName(res.task.rel, 60)
+
+		if res.err != nil {
+			failFiles++
+			failList = append(failList, fmt.Sprintf("%s: %v", res.task.rel, res.err))
+			if !opt.quiet {
+				fmt.Printf("%-5d %-6s %10s %10s %8s  %s\n",
+					done, "FAIL", formatSize(res.task.orig), "-", "-", displayName)
+			}
+			continue
+		}
+
+		successFiles++
+		totalComp += res.compSize
+		ratio := float64(0)
+		if res.task.orig > 0 {
+			ratio = (1 - float64(res.compSize)/float64(res.task.orig)) * 100
+		}
+		if !opt.quiet {
+			tag := "OK"
+			if res.kept {
+				tag = "KEEP"
+				keptFiles++
+			}
+			fmt.Printf("%-5d %-6s %10s %10s %7.1f%%  %s\n",
+				done, tag, formatSize(res.task.orig), formatSize(res.compSize), ratio, displayName)
+		} else if res.kept {
+			keptFiles++
+		}
+	}
+
+	elapsed := time.Since(start)
+	totalRatio := float64(0)
+	if totalOrig > 0 {
+		totalRatio = (1 - float64(totalComp)/float64(totalOrig)) * 100
+	}
+
+	if !opt.quiet {
+		fmt.Println(strings.Repeat("-", tableSepWidth))
+		fmt.Println()
+		fmt.Println("=== 压缩完成 ===")
+		fmt.Printf("总文件数: %d\n", totalFiles)
+		fmt.Printf("成功: %d\n", successFiles)
+		fmt.Printf("失败: %d\n", failFiles)
+		if opt.overwrite && keptFiles > 0 {
+			fmt.Printf("保留原文件（压缩后未变小）: %d\n", keptFiles)
+		}
+		fmt.Printf("原始总大小: %s\n", formatSize(totalOrig))
+		fmt.Printf("压缩后总大小: %s\n", formatSize(totalComp))
+		fmt.Printf("总压缩率: %.1f%%\n", totalRatio)
+		fmt.Printf("总耗时: %s\n", elapsed.Round(time.Millisecond))
+		fmt.Printf("%s\n", opt.outputLine)
+
+		if len(failList) > 0 {
+			fmt.Println()
+			fmt.Println("失败列表:")
+			for _, f := range failList {
+				fmt.Printf("  - %s\n", f)
+			}
+		}
+	} else {
+		fmt.Printf("完成: %d/%d 成功, %s -> %s (%.1f%%), 耗时 %s\n",
+			successFiles, totalFiles,
+			formatSize(totalOrig), formatSize(totalComp),
+			totalRatio, elapsed.Round(time.Millisecond))
+	}
+
+	return failFiles
+}
+
 // 批量压缩目录中的PDF，返回失败文件数（扫描错误返回-1）
 func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressLevel,
 	workers int, quiet bool, gsThreads int, persist, usePermits bool, chunkOverride int, overwrite bool) int32 {
@@ -1147,41 +1521,12 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		return 0
 	}
 
-	// 几何探测：并行完成（每个文件最多读 8MiB）。
-	// 大目录下探测是纯 IO 等待，串行会造成明显的前置延迟；并行度取较小值（4），
-	// 兼顾机械盘/网络盘上的顺序读性能与内存占用（每路峰值约 8MiB）。
-	geoms := make([]pdfGeom, len(pdfs))
-	probeWorkers := workers
-	if probeWorkers > 4 {
-		probeWorkers = 4
-	}
-	if probeWorkers > len(pdfs) {
-		probeWorkers = len(pdfs)
-	}
-	if probeWorkers < 1 {
-		probeWorkers = 1
-	}
-	var probeIdx int32
-	var probeWg sync.WaitGroup
-	for pw := 0; pw < probeWorkers; pw++ {
-		probeWg.Add(1)
-		go func() {
-			defer probeWg.Done()
-			for {
-				i := int(atomic.AddInt32(&probeIdx, 1)) - 1
-				if i >= len(pdfs) {
-					return
-				}
-				geoms[i] = probePDFGeom(pdfs[i])
-			}
-		}()
-	}
-	probeWg.Wait()
+	// 几何探测：并行完成（每个文件最多读 8MiB）
+	geoms := probeAll(pdfs, workers)
 
 	// 构造任务并预建输出目录（原实现每个文件都 MkdirAll 一次）
 	tasks := make([]*fileTask, 0, len(pdfs))
 	dirCache := make(map[string]bool, 16)
-	var geomDegraded []string
 	for i, p := range pdfs {
 		rel, relErr := filepath.Rel(absDir, p)
 		if relErr != nil {
@@ -1206,314 +1551,133 @@ func runBatch(gsExe, inputDir, outputDir string, recursive bool, level CompressL
 		// 像素当 pt 扫描件    → "fix:<纸张>"（启用几何基准修正）
 		t.geom = geoms[i]
 		t.geomKey = geomGroupKey(t.geom)
-		if t.geom.readDegraded {
-			geomDegraded = append(geomDegraded, rel)
-		}
 		tasks = append(tasks, t)
 	}
 
-	// 探测降级提示：读取不完整的文件，其几何判定可能失真 ——
-	// 本该启用修正的扫描件会被按常规参数处理，压缩率低于预期且无其它迹象。
-	// 如实提示（走 stderr，不干扰 stdout 的结果行），而不是静默降质。
-	if len(geomDegraded) > 0 {
-		fmt.Fprintf(os.Stderr,
-			"[提示] %d 个文件读取不完整，几何判定可能失真（将按常规参数处理，压缩率或低于预期）：\n",
-			len(geomDegraded))
-		for _, n := range geomDegraded {
-			fmt.Fprintf(os.Stderr, "  - %s\n", truncName(n, 60))
-		}
-		fmt.Fprintln(os.Stderr)
-	}
+	warnGeomDegraded(tasks)
 
-	// 规划分块：决定“单进程多文件”还是“一文件一进程”
-	chunkSize := planChunkSize(len(tasks), workers, chunkOverride)
-	usePersist := persist && usePermits && chunkSize > 1
-
-	if !quiet {
-		mode := "每文件独立进程"
-		if usePersist {
-			mode = fmt.Sprintf("单进程批量（每进程 %d 个文件）", chunkSize)
-		}
-		fmt.Printf("找到 %d 个PDF文件，开始压缩... [%s]\n\n", len(tasks), mode)
-		fmt.Printf("%-5s %-6s %10s %10s %8s  %s\n", "#", "状态", "原始", "压缩后", "压缩率", "文件")
-		fmt.Println(strings.Repeat("-", tableSepWidth))
-	}
-
-	// 构建分块：按「几何分组」先归类，再在组内按体积轮转分配。
-	//
-	// 为什么要先按 geomKey 分组：
-	// 几何基准修正参数是 gs 进程级的，一个进程内所有文件共享同一套页面设备参数。
-	// 若把「标准 A4 公文」与「像素当 pt 扫描件」放进同一进程，
-	// 扫描件所需的 -dFIXEDMEDIA/-r 会同时作用到公文上，破坏其原始版式。
-	// 因此分组是正确性要求，不是优化。
-	//
-	// 组内分配沿用原策略：按体积从大到小排序后轮转分配。
-	// 注意不要用“按字节负载最小”的贪心分配——小文件体积小，会全部涌入同一个
-	// 负载最小的块，形成极长的尾块。轮转分配可同时均衡文件数与总体积。
-	var chunks [][]*fileTask
-	if usePersist {
-		// 1) 按 geomKey 归组（保持文件顺序稳定，便于复现）
-		var groupOrder []string
-		groupMap := make(map[string][]*fileTask)
-		for _, t := range tasks {
-			if _, ok := groupMap[t.geomKey]; !ok {
-				groupOrder = append(groupOrder, t.geomKey)
-			}
-			groupMap[t.geomKey] = append(groupMap[t.geomKey], t)
-		}
-		// 2) 每组内部分块
-		for _, key := range groupOrder {
-			grp := groupMap[key]
-			numChunks := (len(grp) + chunkSize - 1) / chunkSize
-			if numChunks < 1 {
-				numChunks = 1
-			}
-			part := make([][]*fileTask, numChunks)
-			order := make([]int, len(grp))
-			for i := range order {
-				order[i] = i
-			}
-			sort.SliceStable(order, func(a, b int) bool { return grp[order[a]].orig > grp[order[b]].orig })
-			for k, idx := range order {
-				c := k % numChunks
-				part[c] = append(part[c], grp[idx])
-			}
-			for _, c := range part {
-				if len(c) > 0 {
-					chunks = append(chunks, c)
-				}
-			}
-		}
-	} else {
-		chunks = make([][]*fileTask, len(tasks))
-		for i, t := range tasks {
-			chunks[i] = []*fileTask{t}
-		}
-	}
-
+	// gs SAFER 沙箱授权：读取源文件、写输出目录都需要显式放行
 	permitRead := []string{withSep(absDir)}
 	permitWrite := []string{withSep(absDir), withSep(absOut)}
-
-	// 结果通道：由主 goroutine 统一打印，统计量无需加锁
-	results := make(chan fileResult, 256)
-	chunkCh := make(chan []*fileTask, len(chunks))
-	for _, c := range chunks {
-		chunkCh <- c
+	outputLine := "输出目录: " + absOut
+	if overwrite {
+		outputLine = "输出方式: 已覆盖原文件"
 	}
-	close(chunkCh)
+	return processTasks(tasks, permitRead, permitWrite, taskSetOptions{
+		gsExe: gsExe, level: level, workers: workers, quiet: quiet, gsThreads: gsThreads,
+		persist: persist, usePermits: usePermits, chunk: chunkOverride, overwrite: overwrite,
+		start: start, outputLine: outputLine,
+	})
+}
 
-	par := workers
-	if par > len(chunks) {
-		par = len(chunks)
+// runFiles 处理一批「拖放 / 位置参数」指定的 PDF 文件（可来自不同目录）。
+//
+// 与目录批量共用 processTasks，因此分块、并发、单进程复用、结果表格与汇总
+// 显示完全一致；两者唯一的区别是输出位置：
+//   - 目录模式：输出到 <输入目录>/compressed/（或 -out 指定目录），保留相对路径；
+//   - 文件模式：输出写到每个源文件同目录下的「原名_<级别>.pdf」。
+//
+// 传入的文件已由调用方确认存在且扩展名为 .pdf。
+func runFiles(gsExe string, files []string, level CompressLevel, workers int, quiet bool,
+	gsThreads int, persist, usePermits bool, chunkOverride int, overwrite bool) int32 {
+
+	start := time.Now()
+	if workers < 1 {
+		workers = 1
 	}
-	if par < 1 {
-		par = 1
-	}
 
-	var wg sync.WaitGroup
-	var persistBroken int32 // 一旦发现本机单进程模式不可用，后续块直接走逐文件
-
-	// 进度提示：单进程批量模式下，一个块内的多个文件要等整个块跑完才会打印结果，
-	// 大文件场景下会「长时间没有任何输出」，用户容易误以为卡死。
-	// 因此块一开始就打印一行“开始处理”，让用户始终能看到进展。
-	var progressMu sync.Mutex
-	var startedChunks int32
-
-	for w := 0; w < par; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			// 后处理：覆盖模式下用临时文件替换原文件；未变小时保留原文件
-			finalize := func(t *fileTask) fileResult {
-				// 空文件（0 字节，或 os.Stat 失败导致 orig=0）：gs 会成功写出一个
-				// 空白 PDF，仅凭体积安全网会把它算成 KEEP 成功。这里与
-				// compressFile 的守卫保持一致，直接判失败并清掉产物。
-				if t.orig == 0 {
-					os.Remove(t.writePath)
-					return fileResult{task: t, err: fmt.Errorf("源文件为空或无法读取（0 字节，已保留原文件）")}
-				}
-				compSize := fileSize(t.writePath)
-				if compSize <= 0 || compSize >= t.orig {
-					os.Remove(t.writePath)
-					return fileResult{task: t, compSize: t.orig, kept: true}
-				}
-				if t.overwrite {
-					if err := replaceOriginal(t.writePath, t.finalPath); err != nil {
-						os.Remove(t.writePath)
-						return fileResult{task: t, err: fmt.Errorf("替换原文件失败（可能被占用）: %v", err)}
-					}
-				}
-				return fileResult{task: t, compSize: compSize}
-			}
-			// 失败：清理残留（临时文件或半成品），避免留下误导性的文件
-			failed := func(t *fileTask, e error) fileResult {
-				os.Remove(t.writePath)
-				return fileResult{task: t, err: e}
-			}
-			// 逐文件处理一个块（也是单进程模式不可用时的降级路径）
-			runPerFile := func(chunk []*fileTask) {
-				for _, t := range chunk {
-					if e := compressFile(gsExe, t.input, t.writePath, level, gsThreads); e != nil {
-						results <- failed(t, e)
-						continue
-					}
-					results <- finalize(t)
-				}
-			}
-
-			for chunk := range chunkCh {
-				if atomic.LoadInt32(&persistBroken) == 1 {
-					runPerFile(chunk)
-					continue
-				}
-
-				// 块内多文件时先报进度，避免「长时间无输出」被误判为卡死
-				if !quiet && len(chunk) > 1 {
-					n := atomic.AddInt32(&startedChunks, 1)
-					progressMu.Lock()
-					fmt.Printf("  ... 开始第 %d/%d 批（%d 个文件，起始：%s）\n",
-						n, len(chunks), len(chunk), truncName(chunk[0].rel, 40))
-					progressMu.Unlock()
-				}
-
-				inputs := make([]string, len(chunk))
-				outputs := make([]string, len(chunk))
-				for i, t := range chunk {
-					inputs[i] = t.input
-					outputs[i] = t.writePath
-				}
-				// 同 chunk 内 geomKey 必然相同（分块时已按 geomKey 归类），
-				// 取第一个任务的几何信息代表整块即可。
-				chunkErr := compressChunk(gsExe, inputs, outputs, level, gsThreads,
-					permitRead, permitWrite, chunk[0].geom)
-
-				// 整块成功要求“每个文件都产出了有效文件”。只要有任何一个缺失就整块重做，
-				// 否则可能把异常产物（例如内容被合并进第一个文件）当作成功结果接受。
-				chunkOK := chunkErr == nil
-				if chunkOK {
-					for _, t := range chunk {
-						if !validOutput(t.writePath) {
-							chunkOK = false
-							break
-						}
-					}
-				}
-				if chunkOK {
-					for _, t := range chunk {
-						results <- finalize(t)
-					}
-					continue
-				}
-
-				// 一个产物都没有 → 判定本机不支持单进程模式（如 gs 版本/构建差异），
-				// 后续块直接走逐文件，避免每次都白跑一遍。
-				if len(chunk) > 1 {
-					anyValid := false
-					for _, t := range chunk {
-						if validOutput(t.writePath) {
-							anyValid = true
-							break
-						}
-					}
-					if !anyValid && atomic.CompareAndSwapInt32(&persistBroken, 0, 1) && !quiet {
-						fmt.Fprintln(os.Stderr, "[提示] 单进程批量模式在本机不可用，已自动切换为逐文件模式")
-					}
-				}
-				runPerFile(chunk)
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var totalFiles int32 = int32(len(tasks))
-	var successFiles int32
-	var failFiles int32
-	var keptFiles int32
-	var totalOrig int64
-	var totalComp int64
-	var done int32
-	failList := make([]string, 0)
-
-	for res := range results {
-		done++
-		totalOrig += res.task.orig
-
-		displayName := truncName(res.task.rel, 60)
-
-		if res.err != nil {
-			failFiles++
-			failList = append(failList, fmt.Sprintf("%s: %v", res.task.rel, res.err))
-			if !quiet {
-				fmt.Printf("%-5d %-6s %10s %10s %8s  %s\n",
-					done, "FAIL", formatSize(res.task.orig), "-", "-", displayName)
-			}
+	// 去重：同一文件可能被重复拖入，或同时以相对/绝对路径出现
+	seen := make(map[string]bool, len(files))
+	uniq := make([]string, 0, len(files))
+	for _, f := range files {
+		key := filepath.Clean(f)
+		if abs, err := filepath.Abs(f); err == nil {
+			key = filepath.Clean(abs)
+		}
+		if seen[key] {
 			continue
 		}
-
-		successFiles++
-		totalComp += res.compSize
-		ratio := float64(0)
-		if res.task.orig > 0 {
-			ratio = (1 - float64(res.compSize)/float64(res.task.orig)) * 100
-		}
-		if !quiet {
-			tag := "OK"
-			if res.kept {
-				tag = "KEEP"
-				keptFiles++
-			}
-			fmt.Printf("%-5d %-6s %10s %10s %7.1f%%  %s\n",
-				done, tag, formatSize(res.task.orig), formatSize(res.compSize), ratio, displayName)
-		} else if res.kept {
-			keptFiles++
-		}
+		seen[key] = true
+		uniq = append(uniq, f)
 	}
-
-	elapsed := time.Since(start)
-	totalRatio := float64(0)
-	if totalOrig > 0 {
-		totalRatio = (1 - float64(totalComp)/float64(totalOrig)) * 100
-	}
+	files = uniq
 
 	if !quiet {
-		fmt.Println(strings.Repeat("-", tableSepWidth))
-		fmt.Println()
-		fmt.Println("=== 压缩完成 ===")
-		fmt.Printf("总文件数: %d\n", totalFiles)
-		fmt.Printf("成功: %d\n", successFiles)
-		fmt.Printf("失败: %d\n", failFiles)
-		if overwrite && keptFiles > 0 {
-			fmt.Printf("保留原文件（压缩后未变小）: %d\n", keptFiles)
-		}
-		fmt.Printf("原始总大小: %s\n", formatSize(totalOrig))
-		fmt.Printf("压缩后总大小: %s\n", formatSize(totalComp))
-		fmt.Printf("总压缩率: %.1f%%\n", totalRatio)
-		fmt.Printf("总耗时: %s\n", elapsed.Round(time.Millisecond))
 		if overwrite {
-			fmt.Printf("输出方式: 已覆盖原文件\n")
+			fmt.Printf("输入文件: %d 个（覆盖原文件，先写临时文件、成功后再替换）\n", len(files))
 		} else {
-			fmt.Printf("输出目录: %s\n", absOut)
+			fmt.Printf("输入文件: %d 个\n", len(files))
+			fmt.Printf("输出:    与源文件同目录，命名 原名_%s.pdf\n", levelSlug(level))
 		}
-
-		if len(failList) > 0 {
-			fmt.Println()
-			fmt.Println("失败列表:")
-			for _, f := range failList {
-				fmt.Printf("  - %s\n", f)
-			}
-		}
-	} else {
-		fmt.Printf("完成: %d/%d 成功, %s -> %s (%.1f%%), 耗时 %s\n",
-			successFiles, totalFiles,
-			formatSize(totalOrig), formatSize(totalComp),
-			totalRatio, elapsed.Round(time.Millisecond))
+		fmt.Printf("并发数: %d\n", workers)
+		fmt.Println()
+		fmt.Println("正在扫描PDF文件...")
 	}
 
-	return failFiles
+	geoms := probeAll(files, workers)
+
+	// 极端情况拦截：某个文件的输出名正好等于本次另一个源文件名
+	// （例如同时拖入 a.pdf 与 a_ebook.pdf、级别 ebook）。
+	// 并发/分块写入会覆盖尚未处理的源文件，必须直接拒绝。
+	if !overwrite {
+		inputSet := make(map[string]bool, len(files))
+		for _, f := range files {
+			if abs, err := filepath.Abs(f); err == nil {
+				inputSet[filepath.Clean(abs)] = true
+			}
+		}
+		for _, p := range files {
+			ext := filepath.Ext(p)
+			out := strings.TrimSuffix(p, ext) + "_" + levelSlug(level) + ext
+			abs, err := filepath.Abs(out)
+			if err != nil || !inputSet[filepath.Clean(abs)] || samePath(out, p) {
+				continue
+			}
+			fmt.Fprintf(os.Stderr,
+				"错误: 输出文件 %s 与本次拖入的另一个源文件同名，为避免覆盖已终止。\n", out)
+			fmt.Fprintln(os.Stderr, "      请改用 -out 指定输出目录，或先重命名相关文件。")
+			return -1
+		}
+	}
+
+	tasks := make([]*fileTask, 0, len(files))
+	permitDirSet := make(map[string]bool, 8)
+	for i, p := range files {
+		dir := filepath.Dir(p)
+		permitDirSet[withSep(dir)] = true
+		t := &fileTask{input: p, rel: filepath.Base(p), orig: fileSize(p), overwrite: overwrite}
+		if overwrite {
+			t.writePath = tempOutputPath(dir, i)
+			t.finalPath = p
+		} else {
+			ext := filepath.Ext(p)
+			out := strings.TrimSuffix(p, ext) + "_" + levelSlug(level) + ext
+			t.writePath = out
+			t.finalPath = out
+		}
+		t.geom = geoms[i]
+		t.geomKey = geomGroupKey(t.geom)
+		tasks = append(tasks, t)
+	}
+
+	warnGeomDegraded(tasks)
+
+	// SAFER 授权：读取源文件与写输出都在各源文件所在目录
+	permitDirs := make([]string, 0, len(permitDirSet))
+	for d := range permitDirSet {
+		permitDirs = append(permitDirs, d)
+	}
+	sort.Strings(permitDirs)
+
+	outputLine := "输出:    与源文件同目录（原名_" + levelSlug(level) + ".pdf）"
+	if overwrite {
+		outputLine = "输出方式: 已覆盖原文件"
+	}
+	return processTasks(tasks, permitDirs, permitDirs, taskSetOptions{
+		gsExe: gsExe, level: level, workers: workers, quiet: quiet, gsThreads: gsThreads,
+		persist: persist, usePermits: usePermits, chunk: chunkOverride, overwrite: overwrite,
+		start: start, outputLine: outputLine,
+	})
 }
 
 // 带值的命令行选项（后一个token是其值）
@@ -1723,6 +1887,10 @@ func main() {
 		fmt.Println(strings.Repeat("=", 60))
 
 		var failTotal int32
+		// 先把「文件」与「文件夹」分开：多个文件合并为一批，走与目录拖放
+		// 完全相同的分块/并发/表格显示；文件夹逐个按目录模式处理。
+		var looseFiles []string
+		var folders []string
 		for _, p := range dropPaths {
 			info, statErr := os.Stat(p)
 			if statErr != nil {
@@ -1731,26 +1899,37 @@ func main() {
 				continue
 			}
 			if info.IsDir() {
-				fmt.Printf("\n>>> 处理文件夹: %s\n", p)
-				fails := runBatch(gsExe, p, "", true, compressLevel, *workers, *quiet, gsT,
-					*persist, usePermits, *chunk, *overwrite)
-				if fails < 0 {
-					failTotal++
-				} else {
-					failTotal += fails
-				}
+				folders = append(folders, p)
 			} else if strings.EqualFold(filepath.Ext(p), ".pdf") {
-				fmt.Printf("\n>>> 处理文件: %s\n", p)
-				outPath := p
-				if !*overwrite {
-					ext := filepath.Ext(p)
-					outPath = strings.TrimSuffix(p, ext) + "_" + levelSlug(compressLevel) + ext
-				}
-				if !runSingle(gsExe, p, outPath, compressLevel, *overwrite, *quiet, gsTSingle) {
-					failTotal++
-				}
+				looseFiles = append(looseFiles, p)
 			} else {
 				fmt.Fprintf(os.Stderr, "\n[跳过] 不是PDF文件: %s\n", p)
+			}
+		}
+
+		if len(looseFiles) > 0 {
+			fmt.Printf("\n>>> 处理文件\n")
+			gsForFiles := gsT
+			if len(looseFiles) == 1 {
+				gsForFiles = gsTSingle
+			}
+			fails := runFiles(gsExe, looseFiles, compressLevel, *workers, *quiet,
+				gsForFiles, *persist, usePermits, *chunk, *overwrite)
+			if fails < 0 {
+				failTotal++
+			} else {
+				failTotal += fails
+			}
+		}
+
+		for _, p := range folders {
+			fmt.Printf("\n>>> 处理文件夹: %s\n", p)
+			fails := runBatch(gsExe, p, "", true, compressLevel, *workers, *quiet, gsT,
+				*persist, usePermits, *chunk, *overwrite)
+			if fails < 0 {
+				failTotal++
+			} else {
+				failTotal += fails
 			}
 		}
 		if failTotal > 0 {

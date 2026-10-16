@@ -38,3 +38,21 @@ func TestCompressFileRejectsDirInput(t *testing.T) {
 		t.Fatalf("目录输入应被判失败，实得 err=%v", err)
 	}
 }
+
+// 多文件拖放：若某个文件的输出名正好等于本次另一个源文件名，
+// 并发/分块写入会覆盖尚未处理的源文件，必须直接拒绝（返回 -1）。
+// 这道拦截发生在调用 gs 之前，因此传入不存在的 gs 路径即可测试。
+func TestRunFilesRejectsOutputInputCollision(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.pdf")
+	b := filepath.Join(dir, "a_ebook.pdf")
+	for _, p := range []string{a, b} {
+		if err := os.WriteFile(p, []byte("%PDF-1.4\n1 0 obj <</Type/Page/MediaBox[0 0 595 842]>> endobj\n%%EOF\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rc := runFiles("/nonexistent/gs-binary", []string{a, b}, LevelEBook, 1, true, 1, true, false, 0, false)
+	if rc != -1 {
+		t.Fatalf("输出与输入同名时应返回 -1，实得 %d", rc)
+	}
+}
