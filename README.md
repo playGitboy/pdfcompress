@@ -40,10 +40,10 @@
 
 **Linux（麒麟 / 统信等 ARM64、x86_64）**
 
-1. 解压 `PDFCompress-linux-<架构>.tar.gz`（**务必用 tar 解压，不要用图形界面复制**，
+1. 解压 `PDFCompress-linux-<架构>.tar.xz`（**务必用 tar 解压，不要用图形界面复制**，
    否则可执行权限会丢失）：
    ```bash
-   tar -xzf PDFCompress-linux-arm64.tar.gz
+   tar -xf PDFCompress-linux-arm64.tar.xz
    cd PDFCompress-linux-arm64
    ```
 2. **启用图形界面拖放**（推荐，只需执行一次）：
@@ -330,8 +330,8 @@ pdfcompress -dir <目录> -timeout 600   # 放宽到 10 分钟
 | 平台      | 架构              | 离线包                               | 运行要求                                              |
 | ------- | --------------- | --------------------------------- | ------------------------------------------------- |
 | Windows | x86（32 位）       | `pdfcompress-windows-x86.zip`     | **Windows 7 / 8 / 10 / 11**，32 位与 64 位系统均可（WoW64） |
-| Linux   | ARM64 (aarch64) | `PDFCompress-linux-arm64.tar.gz`  | 麒麟 V10 / 统信 UOS 等，**内置便携 Ghostscript，免安装免联网**     |
-| Linux   | x86_64 (amd64)  | `PDFCompress-linux-x86_64.tar.gz` | 同上                                                |
+| Linux   | ARM64 (aarch64) | `PDFCompress-linux-arm64.tar.xz`  | 麒麟 V10 / 统信 UOS 等，**内置便携 Ghostscript，免安装免联网**     |
+| Linux   | x86_64 (amd64)  | `PDFCompress-linux-x86_64.tar.xz` | 同上                                                |
 
 - **完全离线**：所有离线包均已包含运行所需的全部文件，目标机无需安装 Ghostscript、  
   无需联网、无需 Node/Python 等任何运行时。

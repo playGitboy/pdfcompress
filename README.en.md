@@ -54,10 +54,10 @@ works well on both **image-heavy (scanned)** and **text-heavy (electronic docume
 
 **Linux (Kylin / UOS, ARM64 & x86_64)**
 
-1. Extract `PDFCompress-linux-<arch>.tar.gz` (**always use `tar`, never a GUI copy**, or the
+1. Extract `PDFCompress-linux-<arch>.tar.xz` (**always use `tar`, never a GUI copy**, or the
    executable bits will be lost):
    ```bash
-   tar -xzf PDFCompress-linux-arm64.tar.gz
+   tar -xf PDFCompress-linux-arm64.tar.xz
    cd PDFCompress-linux-arm64
    ```
 2. **Enable drag-and-drop** (recommended, run once):
@@ -386,8 +386,8 @@ behaviour, and its failure mode is observable and reversible.
 | Platform | Architecture | Offline package | Requirements |
 | --- | --- | --- | --- |
 | Windows | x86 (32-bit) | `pdfcompress-windows-x86.zip` | **Windows 7 / 8 / 10 / 11**, both 32-bit and 64-bit (via WoW64) |
-| Linux | ARM64 (aarch64) | `PDFCompress-linux-arm64.tar.gz` | Kylin V10 / UOS etc. **Bundled portable Ghostscript — no install, no network** |
-| Linux | x86_64 (amd64) | `PDFCompress-linux-x86_64.tar.gz` | Same as above |
+| Linux | ARM64 (aarch64) | `PDFCompress-linux-arm64.tar.xz` | Kylin V10 / UOS etc. **Bundled portable Ghostscript — no install, no network** |
+| Linux | x86_64 (amd64) | `PDFCompress-linux-x86_64.tar.xz` | Same as above |
 
 - **Fully offline** — every package contains everything needed at runtime. No Ghostscript
   install, no network, no Node/Python or any other runtime required.
