@@ -86,6 +86,15 @@ var launchedByDoubleClick = func() bool { return false }
 // Windows 平台在 init() 中注入真实检测（与 launchedByDoubleClick 同模式）。
 var isattyStdout = func() bool { return false }
 
+// consoleWidth 返回交互式控制台每行可显示的列数；无法获取时返回 0。
+//
+// 心跳提示必须据此把内容限制在一行内：Win7 的控制台默认只有 80 列，
+// 而原实现按「字节长度」补空格清除（中日韩字符 3 字节只占 2 列，约 1.5 倍），
+// 提示与清除空格双双超出窗口宽度 → 折行 → 每刷新一次就多出一行空白。
+// 非 Windows 平台默认返回 0（调用方按 80 列兜底），
+// Windows 平台在 init() 中注入真实检测（与 isattyStdout 同模式）。
+var consoleWidth = func() int { return 0 }
+
 // 压缩级别。内置档位用 iota（0-3）；自定义 DPI 用 1000+dpi 编码。
 type CompressLevel int
 
@@ -1015,6 +1024,86 @@ func pause() {
 	fmt.Scanln()
 }
 
+// runeWidth 估算单个字符在控制台占用的显示列数。
+// 中日韩汉字、全角标点、假名、韩文等「宽字符」占 2 列，其余占 1 列。
+func runeWidth(r rune) int {
+	switch {
+	case (r >= 0x1100 && r <= 0x115F) || // 韩文字母
+		(r >= 0x2E80 && r <= 0x303E) || // CJK 部首补充、CJK 符号标点
+		(r >= 0x3041 && r <= 0x33FF) || // 假名、CJK 兼容
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK 扩展 A
+		(r >= 0x4E00 && r <= 0x9FFF) || // CJK 基本汉字
+		(r >= 0xAC00 && r <= 0xD7A3) || // 韩文音节
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK 兼容汉字
+		(r >= 0xFE30 && r <= 0xFE6F) || // CJK 兼容形式
+		(r >= 0xFF00 && r <= 0xFF60) || // 全角 ASCII、全角标点
+		(r >= 0xFFE0 && r <= 0xFFE6) || // 全角符号
+		(r >= 0x20000 && r <= 0x3FFFD): // CJK 扩展 B 及以后
+		return 2
+	}
+	return 1
+}
+
+// displayWidth 计算字符串在控制台占用的显示列数（不是字节数）。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		w += runeWidth(r)
+	}
+	return w
+}
+
+// fitToWidth 把 s 裁剪到不超过 max 个显示列；被裁掉时以 ... 结尾。
+func fitToWidth(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= max {
+		return s
+	}
+	limit := max
+	suffix := ""
+	if max >= 4 {
+		limit = max - 3 // 给省略号留 3 列
+		suffix = "..."
+	}
+	var b strings.Builder
+	w := 0
+	for _, r := range s {
+		rw := runeWidth(r)
+		if w+rw > limit {
+			break
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	return b.String() + suffix
+}
+
+// hbLineWidth 心跳提示可用的显示列数。
+// 控制台宽度取不到时按 Win7 默认 80 列推算，并始终留 1 列余量：
+// 内容若占满最后一列，Windows 控制台同样会折行。
+func hbLineWidth() int {
+	w := consoleWidth()
+	if w <= 0 || w > 1000 {
+		w = 80
+	}
+	return w - 1
+}
+
+// buildHeartbeatMsg 生成一条不超过 limit 列的心跳提示。
+// 文件名过长时逐级缩短，优先保证末尾的耗时信息完整可见。
+func buildHeartbeatMsg(name string, nameMax int, tail string, limit int) string {
+	for n := nameMax; n >= 4; n -= 4 {
+		msg := "仍在处理: " + truncName(name, n) + tail
+		if displayWidth(msg) <= limit {
+			return msg
+		}
+	}
+	// 极端窄的窗口：连文件名都放不下，只保留耗时信息
+	return fitToWidth("仍在处理"+tail, limit)
+}
+
 // startHeartbeat 单文件模式的心跳提示：压缩静默超过 60 秒时在行首原位
 // 刷新（\r）一条提示，防止大文件（上千页 PDF 需数分钟）被误认为卡死。
 // 返回的 stop 会清除心跳行并等待后台协程退出（保证打印结果行时不被干扰）。
@@ -1047,11 +1136,13 @@ func startHeartbeat(name string, quiet bool) (stop func()) {
 				if silent < hbAfter {
 					continue
 				}
-				msg := fmt.Sprintf("仍在处理: %s，已 %s", truncName(name, 40), silent.Round(time.Second))
+				tail := "，已 " + silent.Round(time.Second).String()
+				msg := buildHeartbeatMsg(name, 40, tail, hbLineWidth())
 				clear()
 				fmt.Print("\r" + msg)
-				// 按字节长度清除：中日韩字符 3 字节 > 2 列宽，必然覆盖干净
-				hbLen = len(msg)
+				// 按显示列数清除：空格每列 1 宽，正好盖掉上一帧；
+				// 且内容已被限制在控制台宽度以内，不会超宽折行留下空行
+				hbLen = displayWidth(msg)
 			}
 		}
 	}()
@@ -1704,12 +1795,13 @@ consumeLoop:
 					lg = t
 				}
 			}
-			msg := fmt.Sprintf("仍在处理: %s 等 %d 个文件，已静默 %s",
-				truncName(lg.rel, 36), len(remaining), silent.Round(time.Second))
+			tail := fmt.Sprintf(" 等 %d 个文件，已静默 %s", len(remaining), silent.Round(time.Second))
+			msg := buildHeartbeatMsg(lg.rel, 36, tail, hbLineWidth())
 			clearHB()
 			fmt.Print("\r" + msg)
-			// 用字节长度做清除宽度：中日韩字符 3 字节 > 2 列宽，必然覆盖干净
-			hbLen = len(msg)
+			// 按显示列数清除：空格每列 1 宽，正好盖掉上一帧；
+			// 且内容已被限制在控制台宽度以内，不会超宽折行留下空行
+			hbLen = displayWidth(msg)
 		}
 	}
 	clearHB()

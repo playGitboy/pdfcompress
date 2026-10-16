@@ -8,10 +8,25 @@ import (
 )
 
 var (
-	procGetConsoleProcessList = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleProcessList")
-	procGetConsoleMode        = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleMode")
-	procSetConsoleMode        = syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode")
+	procGetConsoleProcessList      = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleProcessList")
+	procGetConsoleMode             = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleMode")
+	procSetConsoleMode             = syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode")
+	procGetConsoleScreenBufferInfo = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleScreenBufferInfo")
 )
+
+// CONSOLE_SCREEN_BUFFER_INFO 及其成员类型，与 Windows API 定义一一对应。
+// 全部为定长整数、无指针字段，可安全地通过 syscall 传址调用。
+type coord struct{ x, y int16 }
+
+type smallRect struct{ left, top, right, bottom int16 }
+
+type consoleScreenBufferInfo struct {
+	size              coord
+	cursorPosition    coord
+	attributes        uint16
+	window            smallRect
+	maximumWindowSize coord
+}
 
 // 控制台模式位
 const (
@@ -22,6 +37,9 @@ const (
 func init() {
 	launchedByDoubleClick = detectDoubleClick
 	isattyStdout = stdoutIsConsole
+	// 心跳提示要按窗口实际宽度裁剪。Win7 默认仅 80 列，
+	// 提示一旦超宽就会折行，每刷新一次都会多出一行空白。
+	consoleWidth = winConsoleWidth
 	// 拖放/双击启动的控制台窗口，是我们自己创建的交互窗口，最容易误触快速编辑：
 	// 用户把文件拖进来之后鼠标就停在窗口里，一次单击就会让控制台进入
 	// “标记（Mark）”状态。此时控制台会**阻塞一切标准输出写入**，
@@ -58,6 +76,30 @@ func stdoutIsConsole() bool {
 	var mode uint32
 	r, _, _ := procGetConsoleMode.Call(uintptr(h), uintptr(unsafe.Pointer(&mode)))
 	return r != 0
+}
+
+// winConsoleWidth 返回当前控制台每行可显示的列数；不是控制台（输出被重定向）
+// 或调用失败时返回 0，由调用方按 80 列兜底。
+//
+// 取「窗口可见宽度」与「缓冲区宽度」的较小值：Win7 下缓冲区可能比窗口宽
+// （窗口出现横向滚动条），此时文本是在缓冲区宽度处折行的。
+func winConsoleWidth() int {
+	h, err := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
+	if err != nil || h == 0 || h == syscall.InvalidHandle {
+		return 0
+	}
+	var info consoleScreenBufferInfo
+	if r, _, _ := procGetConsoleScreenBufferInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&info))); r == 0 {
+		return 0
+	}
+	w := int(info.window.right-info.window.left) + 1
+	if bw := int(info.size.x); bw > 0 && bw < w {
+		w = bw
+	}
+	if w <= 0 {
+		return 0
+	}
+	return w
 }
 
 // disableQuickEdit 关闭当前控制台的「快速编辑模式」。

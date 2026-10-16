@@ -112,20 +112,75 @@ func TestStartHeartbeatRedirected(t *testing.T) {
 	}
 }
 
-// 清除心跳行必须按「字节长度」补空格：中日韩字符 3 字节对应 2 列宽、
-// ASCII 1 字节对应 1 列宽，因此字节长度 ≥ 显示宽度，空格必能盖掉上一帧。
-func TestHeartbeatClearWidthCoversCJK(t *testing.T) {
-	msg := "仍在处理: 大文件.pdf，已 1m0s"
-	// 按控制台显示规则估算宽度：CJK（>0x7F）按 2 列，其余按 1 列
-	display := 0
-	for _, r := range msg {
-		if r > 0x7F {
-			display += 2
-		} else {
-			display++
-		}
+// 心跳提示必须限制在一行内。Win7 控制台默认 80 列，提示一旦超宽就会折行，
+// 紧接着的清除空格同样超宽再折行一次 —— 表现为每刷新一次多出一行空白。
+func TestHeartbeatMsgFitsConsoleWidth(t *testing.T) {
+	oldWidth := consoleWidth
+	consoleWidth = func() int { return 80 }
+	defer func() { consoleWidth = oldWidth }()
+
+	limit := hbLineWidth()
+	if limit != 79 {
+		t.Fatalf("80 列控制台应留 1 列余量，可用 79 列，实得 %d", limit)
 	}
-	if len(msg) < display {
-		t.Fatalf("字节长度 %d 应不小于显示宽度 %d，否则清除会留残影", len(msg), display)
+	name := "2023年中华人民共和国海关进出口税则（第一批修订版）最终稿.pdf"
+	tail := "，已 " + (2*time.Minute + 30*time.Second).String()
+	msg := buildHeartbeatMsg(name, 40, tail, limit)
+	if got := displayWidth(msg); got > limit {
+		t.Fatalf("提示宽度 %d 超过可用宽度 %d: %q", got, limit, msg)
+	}
+	if !strings.Contains(msg, "2m30s") {
+		t.Errorf("缩短文件名后仍应保留耗时信息, 实得: %q", msg)
+	}
+	if !strings.HasPrefix(msg, "仍在处理: ") {
+		t.Errorf("提示前缀缺失: %q", msg)
+	}
+}
+
+// 控制台宽度不明确（非 Windows / 获取失败）时按 Win7 默认 80 列兜底。
+func TestHeartbeatLineWidthFallback(t *testing.T) {
+	oldWidth := consoleWidth
+	consoleWidth = func() int { return 0 }
+	defer func() { consoleWidth = oldWidth }()
+	if got := hbLineWidth(); got != 79 {
+		t.Fatalf("宽度未知时应按 80 列兜底（可用 79 列），实得 %d", got)
+	}
+}
+
+// 收窄窗口下，输出的每一帧（\r 分隔）都不得超过可用列数，
+// 且清除用的空格数正好等于该帧宽度：既不留残影，也不因超宽折行。
+func TestHeartbeatFramesFitConsoleWidth(t *testing.T) {
+	oldIsatty, oldAfter, oldInterval, oldWidth := isattyStdout, hbAfter, hbInterval, consoleWidth
+	isattyStdout = func() bool { return true }
+	consoleWidth = func() int { return 40 } // 40 列：逼出裁剪逻辑
+	hbAfter = 100 * time.Millisecond
+	hbInterval = 50 * time.Millisecond
+	defer func() {
+		isattyStdout, hbAfter, hbInterval, consoleWidth = oldIsatty, oldAfter, oldInterval, oldWidth
+	}()
+
+	var out string
+	done := make(chan struct{})
+	go func() {
+		out = captureStdout(t, func() {
+			stop := startHeartbeat("2023年中华人民共和国海关进出口税则.pdf", false)
+			time.Sleep(400 * time.Millisecond)
+			stop()
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("心跳未按时结束")
+	}
+
+	if !strings.Contains(out, "仍在处理") {
+		t.Fatalf("未产生心跳输出: %q", out)
+	}
+	for _, frame := range strings.Split(out, "\r") {
+		if w := displayWidth(frame); w > 39 {
+			t.Errorf("提示帧宽度 %d 超过可用 39 列: %q", w, frame)
+		}
 	}
 }
